@@ -931,6 +931,7 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
                                       DxilTypeSystem &dxilTypeSys) {
   unsigned fieldIdx = 0;
   unsigned CBufferOffset = 0;
+  bool empty_union = false;
   bool bDefaultRowMajor = m_pHLModule->GetHLOptions().bDefaultRowMajor;
   if (const CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
 
@@ -1136,16 +1137,21 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
       if (m_PreciseOutputSet.count(StringRef(fieldSemName).lower()))
         fieldAnnotation.SetPrecise();
     }
-
     // Update offset.
     CBufferSize = std::max(CBufferSize, CBufferOffset + size);
     CBufferOffset = CBufferSize;
 
+    if (RD->isUnion())
+      break;
+
     ++Field;
   }
 
+  if (RD->isUnion() && CBufferSize == 0)
+    empty_union = true;
+
   annotation->SetCBufferSize(CBufferSize);
-  dxilTypeSys.FinishStructAnnotation(*annotation);
+  dxilTypeSys.FinishStructAnnotation(*annotation, empty_union);
   return CBufferSize;
 }
 
@@ -1277,6 +1283,21 @@ unsigned CGMSHLSLRuntime::AddTypeAnnotation(QualType Ty,
     unsigned size = ConstructStructAnnotation(annotation, payloadAnnotation, RD, dxilTypeSys);
     // Resources don't count towards cbuffer size.
     return IsHLSLResourceType(Ty) ? 0 : size;
+  } else if (const RecordType *RT = paramTy->getAsUnionType()) {
+    RecordDecl *RD = RT->getDecl();
+    llvm::StructType *ST = CGM.getTypes().ConvertRecordDeclType(RD);
+    if (DxilStructAnnotation *annotation = dxilTypeSys.GetStructAnnotation(ST)) {
+      unsigned structSize = annotation->GetCBufferSize();
+      return structSize;
+    }
+    DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(
+        ST, GetNumTemplateArgsForRecordDecl(RT->getDecl()), true);
+    DxilPayloadAnnotation *payloadAnnotation = nullptr;
+    if (ValidatePayloadDecl(RT->getDecl(), *m_pHLModule->GetShaderModel(),
+                            CGM.getDiags(), CGM.getCodeGenOpts()))
+      payloadAnnotation = dxilTypeSys.AddPayloadAnnotation(ST);
+    return ConstructStructAnnotation(annotation, payloadAnnotation, RD,
+                                     dxilTypeSys);
   } else if (const RecordType *RT = dyn_cast<RecordType>(paramTy)) {
     // For this pointer.
     RecordDecl *RD = RT->getDecl();
