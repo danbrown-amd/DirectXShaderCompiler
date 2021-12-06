@@ -159,6 +159,10 @@ public:
   bool UseMinPrecision = true; // use min precision, not native precision.
   bool EnableDX9CompatMode = false;
   bool EnableFXCCompatMode = false;
+  bool EnableTemplates = false;
+  bool EnableUnions = false;
+  bool EnableOperatorOverloading = false;
+  bool StrictUDTCasting = false;
   bool EnablePayloadAccessQualifiers = false;
   bool DumpImplicitTopLevelDecls = true;
   /// Whether use row major as default matrix major.

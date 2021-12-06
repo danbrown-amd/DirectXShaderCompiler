@@ -79,6 +79,10 @@ public:
   TEST_METHOD(RunIncompleteArray)
   TEST_METHOD(RunTemplateChecks)
   TEST_METHOD(RunTemplateLiteralSubstitutionFailure)
+  TEST_METHOD(RunUnionAnon)
+  TEST_METHOD(RunUnionDerivedToBase)
+  TEST_METHOD(RunUnionSizeOf)
+  TEST_METHOD(RunUnions0)
   TEST_METHOD(RunVarmodsSyntax)
   TEST_METHOD(RunVectorAssignments)
   TEST_METHOD(RunVectorSyntaxMix)
@@ -357,6 +361,21 @@ TEST_F(VerifierTest, RunTemplateChecks) {
 
 TEST_F(VerifierTest, RunTemplateLiteralSubstitutionFailure) {
   CheckVerifiesHLSL(L"template-literal-substitution-failure.hlsl");
+}
+TEST_F(VerifierTest, RunUnionAnon) {
+  CheckVerifiesHLSL(L"union_anon.hlsl");
+}
+
+TEST_F(VerifierTest, RunUnionDerivedToBase) {
+  CheckVerifiesHLSL(L"union-derived-to-base.hlsl");
+}
+
+TEST_F(VerifierTest, RunUnionSizeOf) {
+  CheckVerifiesHLSL(L"union-sizeof.hlsl");
+}
+
+TEST_F(VerifierTest, RunUnions0) {
+  CheckVerifiesHLSL(L"unions_0.hlsl");
 }
 
 TEST_F(VerifierTest, RunVarmodsSyntax) {

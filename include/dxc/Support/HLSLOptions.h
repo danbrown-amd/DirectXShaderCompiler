@@ -211,6 +211,15 @@ public:
   bool TimeReport = false; // OPT_ftime_report
   std::string TimeTrace = ""; // OPT_ftime_trace[EQ]
   bool VerifyDiagnostics = false; // OPT_verify
+  bool EnableTemplates = false; // OPT_enable_templates
+  bool EnableUnions = false;          // OPT_enable_unions
+  bool EnableOperatorOverloading = false; // OPT_enable_operator_overloading
+  bool StrictUDTCasting = false; // OPT_strict_udt_casting
+
+  // Experimental option to enable short-circuiting operators
+  bool EnableShortCircuit = false; // OPT_enable_short_circuit
+
+  bool EnableBitfields = false; // OPT_enable_bitfields
 
   // Optimization pass enables, disables and selects
   std::map<std::string, bool> DxcOptimizationToggles; // OPT_opt_enable & OPT_opt_disable
