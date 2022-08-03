@@ -1092,9 +1092,6 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
     CBufferSize = std::max(CBufferSize, CBufferOffset + size);
     CBufferOffset = CBufferSize;
 
-    if (RD->isUnion())
-      break;
-
     ++Field;
   }
 
@@ -1242,7 +1239,7 @@ unsigned CGMSHLSLRuntime::AddTypeAnnotation(QualType Ty,
       return structSize;
     }
     DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(
-        ST, GetNumTemplateArgsForRecordDecl(RT->getDecl()), true);
+        ST, GetNumTemplateArgsForRecordDecl(RT->getDecl()));
     DxilPayloadAnnotation *payloadAnnotation = nullptr;
     if (ValidatePayloadDecl(RT->getDecl(), *m_pHLModule->GetShaderModel(),
                             CGM.getDiags(), CGM.getCodeGenOpts()))
