@@ -48,6 +48,8 @@ union S {
   uint x : 8;
 } s;
 
+// CHECK: !DIDerivedType(tag: DW_TAG_member, name: "x", {{.*}}, size: 8, align: 32)
+
 union A {
   bool m_sorted : 1;
 };
@@ -72,12 +74,6 @@ void test() {
   test.foo.subid = 10;
 }
 
-union P1 {
-  uint l_Packed;
-  uint k_Packed : 6,
-      i_Packed : 15,
-      j_Packed : 11;
-};
 
 union P2 {
   uint l_Packed;
@@ -86,7 +82,6 @@ union P2 {
   uint c;
 };
 
-union P1 sM_Packed;
 
 int p() : OUT {
   union P2 x;
