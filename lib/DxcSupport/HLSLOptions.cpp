@@ -532,7 +532,8 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
      opts.EnableUnions = Args.hasFlag(OPT_enable_unions, OPT_INVALID, false);
     if (opts.HLSLVersion <= hlsl::LangStd::v2015) {
       if (opts.EnableUnions)
-        errors << "/enable-unions is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
+        errors << "/enable-unions is not supported with HLSL Version "
+               << (unsigned long)opts.HLSLVersion;
 
       return 1;
     }
