@@ -44,6 +44,7 @@
 #include "dxc/Support/microcom.h"
 #include "dxc/Support/HLSLOptions.h"
 #include "dxc/Support/Unicode.h"
+#include "dxc/DXIL/DxilUtil.h"
 
 #include <fstream>
 #include "llvm/Bitcode/ReaderWriter.h"
@@ -53,6 +54,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ModuleSlotTracker.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/MSFileSystem.h"
@@ -197,6 +200,8 @@ public:
   TEST_METHOD(CheckSATPassFor66_DynamicFromHeap)
 
   TEST_METHOD(AddToASPayload)
+
+  TEST_METHOD(PixStructAnnotation_Lib_DualRaygen)
 
   TEST_METHOD(PixStructAnnotation_Simple)
   TEST_METHOD(PixStructAnnotation_CopiedStruct)
@@ -987,7 +992,10 @@ public:
     std::vector<AllocaWrite> AllocaWrites;
   };
 
-  TestableResults TestStructAnnotationCase(const char* hlsl, const wchar_t* optimizationLevel, bool validateCoverage = true);
+  TestableResults TestStructAnnotationCase(const char *hlsl,
+                                           const wchar_t *optimizationLevel,
+                                           bool validateCoverage = true,
+                                           const wchar_t *profile = L"as_6_5");
   void ValidateAllocaWrite(std::vector<AllocaWrite> const& allocaWrites, size_t index, const char* name);
   std::string RunShaderAccessTrackingPassAndReturnOutputMessages(IDxcBlob* blob);
   std::string RunDxilPIXAddTidToAmplificationShaderPayloadPass(IDxcBlob* blob);
@@ -1821,6 +1829,219 @@ void MSMain(
 
 }
 
+static llvm::DIType *PeelTypedefs(llvm::DIType *diTy) {
+  using namespace llvm;
+  const llvm::DITypeIdentifierMap EmptyMap;
+  while (1) {
+    DIDerivedType *diDerivedTy = dyn_cast<DIDerivedType>(diTy);
+    if (!diDerivedTy)
+      return diTy;
+
+    switch (diTy->getTag()) {
+    case dwarf::DW_TAG_member:
+    case dwarf::DW_TAG_inheritance:
+    case dwarf::DW_TAG_typedef:
+    case dwarf::DW_TAG_reference_type:
+    case dwarf::DW_TAG_const_type:
+    case dwarf::DW_TAG_restrict_type:
+      diTy = diDerivedTy->getBaseType().resolve(EmptyMap);
+      break;
+    default:
+      return diTy;
+    }
+  }
+
+  return diTy;
+}
+
+static unsigned GetDITypeSizeInBits(llvm::DIType *diTy) {
+  return PeelTypedefs(diTy)->getSizeInBits();
+}
+
+static unsigned GetDITypeAlignmentInBits(llvm::DIType *diTy) {
+  return PeelTypedefs(diTy)->getAlignInBits();
+}
+
+static bool FindStructMemberFromStore(llvm::StoreInst *S, std::string *OutMemberName) {
+  using namespace llvm;
+  Value *Ptr = S->getPointerOperand();
+  AllocaInst *Alloca = nullptr;
+
+  auto &DL = S->getModule()->getDataLayout();
+
+  unsigned OffsetInAlloca = 0;
+  while (Ptr) {
+    if (auto AI = dyn_cast<AllocaInst>(Ptr)) {
+      Alloca = AI;
+      break;
+    }
+    else if (auto Gep = dyn_cast<GEPOperator>(Ptr)) {
+      if (Gep->getNumIndices() < 2 ||
+        !Gep->hasAllConstantIndices() ||
+        0 != cast<ConstantInt>(Gep->getOperand(1))->getLimitedValue())
+      {
+        return false;
+      }
+
+      auto GepSrcPtr = Gep->getPointerOperand();
+      Type *GepSrcPtrTy = GepSrcPtr->getType()->getPointerElementType();
+
+      Type *PeelingType = GepSrcPtrTy;
+      for (unsigned i = 1; i < Gep->getNumIndices(); i++) {
+        uint64_t Idx = cast<ConstantInt>(Gep->getOperand(1 + i))->getLimitedValue();
+
+        if (PeelingType->isStructTy()) {
+          auto StructTy = cast<StructType>(PeelingType);
+          unsigned Offset = DL.getStructLayout(StructTy)->getElementOffsetInBits(Idx);
+          OffsetInAlloca += Offset;
+          PeelingType = StructTy->getElementType(Idx);
+        }
+        else if (PeelingType->isVectorTy()) {
+          OffsetInAlloca += DL.getTypeSizeInBits(PeelingType->getVectorElementType()) * Idx;
+          PeelingType = PeelingType->getVectorElementType();
+        }
+        else if (PeelingType->isArrayTy()) {
+          OffsetInAlloca += DL.getTypeSizeInBits(PeelingType->getArrayElementType()) * Idx;
+          PeelingType = PeelingType->getArrayElementType();
+        }
+        else {
+          return false;
+        }
+      }
+
+      Ptr = GepSrcPtr;
+    }
+    else {
+      return false;
+    }
+  }
+
+  // If there's not exactly one dbg.* inst, give up for now.
+  if (hlsl::dxilutil::mdv_user_empty(Alloca) ||
+    std::next(hlsl::dxilutil::mdv_users_begin(Alloca)) != hlsl::dxilutil::mdv_users_end(Alloca))
+  {
+    return false;
+  }
+
+  auto DI = dyn_cast<DbgDeclareInst>(*hlsl::dxilutil::mdv_users_begin(Alloca));
+  if (!DI)
+    return false;
+
+  DILocalVariable *diVar = DI->getVariable();
+  DIExpression *diExpr = DI->getExpression();
+  const llvm::DITypeIdentifierMap EmptyMap;
+  DIType *diType = diVar->getType().resolve(EmptyMap);
+
+  unsigned MemberOffset = OffsetInAlloca;
+  if (diExpr->isBitPiece()) {
+    MemberOffset += diExpr->getBitPieceOffset();
+  }
+
+  diType = PeelTypedefs(diType);
+  if (!isa<DICompositeType>(diType))
+    return false;
+
+  unsigned OffsetInDI = 0;
+  std::string MemberName;
+
+  //=====================================================
+  // Find the correct member based on size
+  while (diType) {
+    diType = PeelTypedefs(diType);
+    if (DICompositeType *diCompType = dyn_cast<DICompositeType>(diType)) {
+      if (diCompType->getTag() == dwarf::DW_TAG_structure_type ||
+          diCompType->getTag() == dwarf::DW_TAG_class_type)
+      {
+        bool FoundCompositeMember = false;
+        for (DINode *Elem : diCompType->getElements()) {
+          auto diElemType = dyn_cast<DIType>(Elem);
+          if (!diElemType)
+            return false;
+
+          StringRef CurMemberName;
+          if (diElemType->getTag() == dwarf::DW_TAG_member) {
+            CurMemberName = diElemType->getName();
+          }
+          else if (diElemType->getTag() == dwarf::DW_TAG_inheritance) {}
+          else {
+            return false;
+          }
+
+          unsigned CompositeMemberSize = GetDITypeSizeInBits(diElemType);
+          unsigned CompositeMemberAlignment = GetDITypeAlignmentInBits(diElemType);
+
+          assert(CompositeMemberAlignment);
+          OffsetInDI = llvm::RoundUpToAlignment(OffsetInDI, CompositeMemberAlignment);
+
+          if (OffsetInDI <= MemberOffset && MemberOffset < OffsetInDI + CompositeMemberSize) {
+            diType = diElemType;
+            if (CurMemberName.size()) {
+              if (MemberName.size())
+                MemberName += ".";
+              MemberName += CurMemberName;
+            }
+            FoundCompositeMember = true;
+            break;
+          }
+
+          // TODO: How will we match up the padding?
+          OffsetInDI += CompositeMemberSize;
+        }
+
+        if (!FoundCompositeMember)
+          return false;
+      }
+      // For arrays, just flatten it for now.
+      // TODO: multi-dimension array
+      else if (diCompType->getTag() == dwarf::DW_TAG_array_type) {
+        if (MemberOffset < OffsetInDI || MemberOffset >= OffsetInDI + diCompType->getSizeInBits())
+          return false;
+        DIType *diArrayElemType = diCompType->getBaseType().resolve(EmptyMap);
+
+        {
+          unsigned CurSize = diCompType->getSizeInBits();
+          unsigned CurOffset = MemberOffset - OffsetInDI;
+          for (DINode *SubrangeMD : diCompType->getElements()) {
+            DISubrange *Range = cast<DISubrange>(SubrangeMD);
+
+            unsigned ElemSize = CurSize / Range->getCount();
+            unsigned Idx = CurOffset / ElemSize;
+
+            CurOffset -= ElemSize * Idx;
+            CurSize = ElemSize;
+
+            MemberName += "[";
+            MemberName += std::to_string(Idx);
+            MemberName += "]";
+          }
+        }
+
+        unsigned ArrayElemSize = GetDITypeSizeInBits(diArrayElemType);
+        unsigned FlattenedIdx = (MemberOffset - OffsetInDI) / ArrayElemSize;
+        OffsetInDI += FlattenedIdx * ArrayElemSize;
+        diType = diArrayElemType;
+      }
+      else {
+        return false;
+      }
+    }
+    else if (DIBasicType *diBasicType = dyn_cast<DIBasicType>(diType)) {
+      if (OffsetInDI == MemberOffset) {
+        *OutMemberName = MemberName;
+        return true;
+      }
+
+      OffsetInDI += diBasicType->getSizeInBits();
+      return false;
+    }
+    else {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 // This function lives in lib\DxilPIXPasses\DxilAnnotateWithVirtualRegister.cpp
 // Declared here so we can test it.
 uint32_t CountStructMembers(llvm::Type const* pType);
@@ -1828,9 +2049,9 @@ uint32_t CountStructMembers(llvm::Type const* pType);
 PixTest::TestableResults PixTest::TestStructAnnotationCase(
     const char* hlsl, 
     const wchar_t * optimizationLevel,
-    bool validateCoverage)
-{
-  CComPtr<IDxcBlob> pBlob = Compile(hlsl, L"as_6_5", {optimizationLevel});
+    bool validateCoverage,
+    const wchar_t *profile) {
+  CComPtr<IDxcBlob> pBlob = Compile(hlsl, profile, {optimizationLevel});
 
   CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
 
@@ -1851,167 +2072,240 @@ PixTest::TestableResults PixTest::TestStructAnnotationCase(
 #endif
 
   ModuleAndHangersOn moduleEtc(pAnnotatedContainer);
-  
-  llvm::Function *entryFunction = moduleEtc.GetDxilModule().GetEntryFunction();
-
-  PixTest::TestableResults ret;
+    PixTest::TestableResults ret;
 
   // For every dbg.declare, run the member iterator and record what it finds:
-  for (auto& block : entryFunction->getBasicBlockList())
-  {
-    for (auto& instruction : block.getInstList())
-    {
-      if (auto* dbgDeclare = llvm::dyn_cast<llvm::DbgDeclareInst>(&instruction))
-      {
-        llvm::Value* Address = dbgDeclare->getAddress();
-        auto* AddressAsAlloca = llvm::dyn_cast<llvm::AllocaInst>(Address);
-        if (AddressAsAlloca != nullptr)
-        {
-            auto* Expression = dbgDeclare->getExpression();
+  auto entryPoints = moduleEtc.GetDxilModule().GetExportedFunctions();
+    for (auto &entryFunction : entryPoints) {
+      for (auto &block : entryFunction->getBasicBlockList()) {
+        for (auto &instruction : block.getInstList()) {
+          if (auto *dbgDeclare =
+                  llvm::dyn_cast<llvm::DbgDeclareInst>(&instruction)) {
+            llvm::Value *Address = dbgDeclare->getAddress();
+            auto *AddressAsAlloca = llvm::dyn_cast<llvm::AllocaInst>(Address);
+            if (AddressAsAlloca != nullptr) {
+              auto *Expression = dbgDeclare->getExpression();
 
-            std::unique_ptr<dxil_debug_info::MemberIterator> iterator = dxil_debug_info::CreateMemberIterator(
-                dbgDeclare,
-                moduleEtc.GetDxilModule().GetModule()->getDataLayout(),
-                AddressAsAlloca,
-                Expression);
+              std::unique_ptr<dxil_debug_info::MemberIterator> iterator =
+                  dxil_debug_info::CreateMemberIterator(
+                      dbgDeclare,
+                      moduleEtc.GetDxilModule().GetModule()->getDataLayout(),
+                      AddressAsAlloca, Expression);
 
-            unsigned int startingBit = 0;
-            unsigned int coveredBits = 0;
-            unsigned int memberIndex = 0;
-            unsigned int memberCount = 0;
-            while (iterator->Next(&memberIndex))
-            {
+              unsigned int startingBit = 0;
+              unsigned int coveredBits = 0;
+              unsigned int memberIndex = 0;
+              unsigned int memberCount = 0;
+              while (iterator->Next(&memberIndex)) {
                 memberCount++;
-                if (memberIndex == 0)
-                {
-                    startingBit = iterator->OffsetInBits(memberIndex);
-                    coveredBits = iterator->SizeInBits(memberIndex);
+                if (memberIndex == 0) {
+                  startingBit = iterator->OffsetInBits(memberIndex);
+                  coveredBits = iterator->SizeInBits(memberIndex);
+                } else {
+                  coveredBits = std::max<unsigned int>(
+                      coveredBits, iterator->OffsetInBits(memberIndex) +
+                                       iterator->SizeInBits(memberIndex));
                 }
-                else
-                {
-                    coveredBits = std::max<unsigned int>(coveredBits, iterator->OffsetInBits(memberIndex) + iterator->SizeInBits(memberIndex));
-                }
-            }
+              }
 
-            ret.OffsetAndSizes.push_back({ memberCount, startingBit, coveredBits });
+              AggregateOffsetAndSize OffsetAndSize = {};
+              OffsetAndSize.countOfMembers = memberCount;
+              OffsetAndSize.offset = startingBit;
+              OffsetAndSize.size = coveredBits;
+              ret.OffsetAndSizes.push_back(OffsetAndSize);
 
-            // Use this independent count of number of struct members to test the 
-            // function that operates on the alloca type:
-            llvm::Type* pAllocaTy = AddressAsAlloca->getType()->getElementType();
-            if (auto* AT = llvm::dyn_cast<llvm::ArrayType>(pAllocaTy))
-            {
-                // This is the case where a struct is passed to a function, and in 
-                // these tests there should be only one struct behind the pointer.
+              // Use this independent count of number of struct members to test
+              // the function that operates on the alloca type:
+              llvm::Type *pAllocaTy =
+                  AddressAsAlloca->getType()->getElementType();
+              if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(pAllocaTy)) {
+                // This is the case where a struct is passed to a function, and
+                // in these tests there should be only one struct behind the
+                // pointer.
                 VERIFY_ARE_EQUAL(AT->getNumElements(), 1);
                 pAllocaTy = AT->getArrayElementType();
-            }
+              }
 
-            if (auto* ST = llvm::dyn_cast<llvm::StructType>(pAllocaTy))
-            {
+              if (auto *ST = llvm::dyn_cast<llvm::StructType>(pAllocaTy)) {
                 uint32_t countOfMembers = CountStructMembers(ST);
-                // memberIndex might be greater, because the fragment iterator also includes contained derived types as
-                // fragments, in addition to the members of that contained derived types. CountStructMembers only counts
-                // the leaf-node types.
+                // memberIndex might be greater, because the fragment iterator
+                // also includes contained derived types as fragments, in
+                // addition to the members of that contained derived types.
+                // CountStructMembers only counts the leaf-node types.
                 VERIFY_ARE_EQUAL(countOfMembers, memberCount);
-            }
-            else if (pAllocaTy->isFloatingPointTy() || pAllocaTy->isIntegerTy())
-            {
-                // If there's only one member in the struct in the pass-to-function (by pointer)
-                // case, then the underlying type will have been reduced to the contained type.
+              } else if (pAllocaTy->isFloatingPointTy() ||
+                         pAllocaTy->isIntegerTy()) {
+                // If there's only one member in the struct in the
+                // pass-to-function (by pointer) case, then the underlying type
+                // will have been reduced to the contained type.
                 VERIFY_ARE_EQUAL(1, memberCount);
-            }
-            else
-            {
+              } else {
                 VERIFY_IS_TRUE(false);
+              }
             }
+          }
         }
       }
-    }
-  }
 
-  // The member iterator should find a solid run of bits that is exactly covered
-  // by exactly one of the members found by the annotation pass:
-  if (validateCoverage)
-  {
-      for (auto const& cover : ret.OffsetAndSizes)
-      {
+      // The member iterator should find a solid run of bits that is exactly
+      // covered by exactly one of the members found by the annotation pass:
+      if (validateCoverage) {
+        unsigned CurRegIdx = 0;
+        for (AggregateOffsetAndSize const &cover :
+             ret.OffsetAndSizes) // For each entry read from member iterators
+                                 // and dbg.declares
+        {
           bool found = false;
-          for (auto const& valueLocation : passOutput.valueLocations)
+          for (ValueLocation const &valueLocation :
+               passOutput.valueLocations) // For each allocas and dxil values
           {
-              constexpr unsigned int eightBitsPerByte = 8;
-              if (valueLocation.base * eightBitsPerByte == cover.offset)
-              {
-                  VERIFY_IS_FALSE(found);
-                  found = true;
-                  VERIFY_ARE_EQUAL(valueLocation.count, cover.countOfMembers);
-              }
+            if (CurRegIdx == valueLocation.base) {
+              VERIFY_IS_FALSE(found);
+              found = true;
+              VERIFY_ARE_EQUAL(valueLocation.count, cover.countOfMembers);
+            }
           }
           VERIFY_IS_TRUE(found);
+          CurRegIdx += cover.countOfMembers;
+        }
       }
-  }
 
-  // For every store operation to the struct alloca, check that the annotation pass correctly determined which alloca
-  for (auto& block : entryFunction->getBasicBlockList()) {
-    for (auto& instruction : block.getInstList()) {
-      if (auto* store =
-        llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+      // For every store operation to the struct alloca, check that the
+      // annotation pass correctly determined which alloca
+      for (auto &block : entryFunction->getBasicBlockList()) {
+        for (auto &instruction : block.getInstList()) {
+          if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
 
-        if (auto* pGEP = llvm::dyn_cast<llvm::GetElementPtrInst>(store->getPointerOperand()))
-        {
-          ret.AllocaWrites.push_back({});
-          auto& NewAllocaWrite = ret.AllocaWrites.back();
-          llvm::Value* pPointerOperand = pGEP->getPointerOperand();
-          if (auto* pGEP2 = llvm::dyn_cast<llvm::GetElementPtrInst>(pPointerOperand))
-          {
-            auto *pMemberIndex = llvm::dyn_cast<llvm::ConstantInt>(
-                pGEP->getOperand(2));
-            uint64_t memberIndex = pMemberIndex->getLimitedValue();
-            // Until we have debugging info for floatN, matrixNxM etc., we can't get the name:
-            // auto *secondPointer = pGEP2->getPointerOperandType();
-            // auto* pStruct =
-            // llvm::dyn_cast<llvm::StructType>(secondPointer->getVectorElementType());
-            NewAllocaWrite.memberName =
-                "member" + std::to_string(memberIndex);
-          }
-          else
-          {
-            NewAllocaWrite.memberName = pGEP->getName();
-          }
-
-          llvm::Value* index;
-          if (pix_dxil::PixAllocaRegWrite::FromInst(
-            store, 
-            &NewAllocaWrite.regBase, 
-            &NewAllocaWrite.regSize,
-            &index)) {
-            auto* asInt = llvm::dyn_cast<llvm::ConstantInt>(index);
-            NewAllocaWrite.index = asInt->getLimitedValue();
+            AllocaWrite NewAllocaWrite = {};
+            if (FindStructMemberFromStore(store, &NewAllocaWrite.memberName)) {
+              llvm::Value *index;
+              if (pix_dxil::PixAllocaRegWrite::FromInst(
+                      store, &NewAllocaWrite.regBase, &NewAllocaWrite.regSize,
+                      &index)) {
+                auto *asInt = llvm::dyn_cast<llvm::ConstantInt>(index);
+                NewAllocaWrite.index = asInt->getLimitedValue();
+                ret.AllocaWrites.push_back(NewAllocaWrite);
+              }
+            }
           }
         }
       }
     }
-  }
-
   return ret;
 }
 
 void PixTest::ValidateAllocaWrite(std::vector<AllocaWrite> const &allocaWrites,
                                   size_t index, const char *name) {
   VERIFY_ARE_EQUAL(index, allocaWrites[index].regBase + allocaWrites[index].index);
-#if DBG
+#ifndef NDEBUG
   // Compilation may add a prefix to the struct member name:
   VERIFY_IS_TRUE(0 == strncmp(name, allocaWrites[index].memberName.c_str(), strlen(name)));
 #endif
 }
 
-std::vector<const wchar_t*> OptimizationChoices ({ L"-Od", L"-O1" });
+struct OptimizationChoice {
+  const wchar_t *Flag;
+  bool IsOptimized;
+};
+static const OptimizationChoice OptimizationChoices[] = {
+  { L"-Od", false },
+  { L"-O1", true },
+};
 
-TEST_F(PixTest, PixStructAnnotation_Simple) {
+TEST_F(PixTest, PixStructAnnotation_Lib_DualRaygen) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices)
-  {
+  for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
+
+RaytracingAccelerationStructure Scene : register(t0, space0);
+RWTexture2D<float4> RenderTarget : register(u0);
+
+struct SceneConstantBuffer
+{
+    float4x4 projectionToWorld;
+    float4 cameraPosition;
+    float4 lightPosition;
+    float4 lightAmbientColor;
+    float4 lightDiffuseColor;
+};
+
+ConstantBuffer<SceneConstantBuffer> g_sceneCB : register(b0);
+
+struct RayPayload
+{
+    float4 color;
+};
+
+inline void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
+{
+    float2 xy = index + 0.5f; // center in the middle of the pixel.
+    float2 screenPos = xy;// / DispatchRaysDimensions().xy * 2.0 - 1.0;
+
+    // Invert Y for DirectX-style coordinates.
+    screenPos.y = -screenPos.y;
+
+    // Unproject the pixel coordinate into a ray.
+    float4 world = /*mul(*/float4(screenPos, 0, 1)/*, g_sceneCB.projectionToWorld)*/;
+
+    //world.xyz /= world.w;
+    origin = world.xyz; //g_sceneCB.cameraPosition.xyz;
+    direction = float3(1,0,0);//normalize(world.xyz - origin);
+}
+
+void RaygenCommon()
+{
+    float3 rayDir;
+    float3 origin;
+    
+    // Generate a ray for a camera pixel corresponding to an index from the dispatched 2D grid.
+    GenerateCameraRay(DispatchRaysIndex().xy, origin, rayDir);
+
+    // Trace the ray.
+    // Set the ray's extents.
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = rayDir;
+    // Set TMin to a non-zero small value to avoid aliasing issues due to floating - point errors.
+    // TMin should be kept small to prevent missing geometry at close contact areas.
+    ray.TMin = 0.001;
+    ray.TMax = 10000.0;
+    RayPayload payload = { float4(0, 0, 0, 0) };
+    TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+
+    // Write the raytraced color to the output texture.
+   // RenderTarget[DispatchRaysIndex().xy] = payload.color;
+}
+
+[shader("raygeneration")]
+void Raygen0()
+{
+    RaygenCommon();
+}
+
+[shader("raygeneration")]
+void Raygen1()
+{
+    RaygenCommon();
+}
+)";
+
+      // This is just a crash test until we decide what the right way forward
+      // for #DSLTodo is...
+      CComPtr<IDxcBlob> pBlob = Compile(hlsl, L"lib_6_6", {optimization});
+      CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
+      RunAnnotationPasses(pDxil);
+  }
+}
+
+TEST_F(PixTest, PixStructAnnotation_Simple) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
+
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 struct smallPayload
 {
     uint dummy;
@@ -2027,25 +2321,25 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty())
-      {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[0].size);
-      }
+    if (!Testables.OffsetAndSizes.empty()) {
+      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[0].size);
+    }
 
-      VERIFY_ARE_EQUAL(1, Testables.AllocaWrites.size());
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "dummy");
+    VERIFY_ARE_EQUAL(1, Testables.AllocaWrites.size());
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "dummy");
   }
 }
 
 
 TEST_F(PixTest, PixStructAnnotation_CopiedStruct) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
-  for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
 
       const char* hlsl = R"(
 struct smallPayload
@@ -2082,7 +2376,9 @@ void main()
 
 TEST_F(PixTest, PixStructAnnotation_MixedSizes) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
-    for (auto const* optimization : OptimizationChoices) {
+
+    for (auto choice : OptimizationChoices) {
+        auto optimization = choice.Flag;
 
         const char* hlsl = R"(
 struct smallPayload
@@ -2108,13 +2404,32 @@ void main()
 
         auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-        if (!Testables.OffsetAndSizes.empty()) {
+        if (!choice.IsOptimized) {
             VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
             VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes[0].countOfMembers);
             VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
             // 8 bytes align for uint64_t:
             VERIFY_ARE_EQUAL(32 + 16 + 16 /*alignment for next field*/ + 32 + 32/*alignment for max align*/ + 64,
                 Testables.OffsetAndSizes[0].size);
+        }
+        else {
+            VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes.size());
+
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[0].countOfMembers);
+            VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+            VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[0].size);
+
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[1].countOfMembers);
+            VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[1].offset);
+            VERIFY_ARE_EQUAL(16, Testables.OffsetAndSizes[1].size);
+
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[2].countOfMembers);
+            VERIFY_ARE_EQUAL(32+32, Testables.OffsetAndSizes[2].offset);
+            VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[2].size);
+
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[3].countOfMembers);
+            VERIFY_ARE_EQUAL(32+32+32+/*padding for alignment*/32, Testables.OffsetAndSizes[3].offset);
+            VERIFY_ARE_EQUAL(64, Testables.OffsetAndSizes[3].size);
         }
 
         VERIFY_ARE_EQUAL(4, Testables.AllocaWrites.size());
@@ -2128,7 +2443,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_StructWithinStruct) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
 
       const char* hlsl = R"(
 
@@ -2160,16 +2476,24 @@ void main()
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty()) {
+      if (!choice.IsOptimized) {
           VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
           VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes[0].countOfMembers);
           VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
           VERIFY_ARE_EQUAL(4 * 32, Testables.OffsetAndSizes[0].size);
       }
+      else {
+          VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes.size());
+          for (int i = 0; i < 4; i++) {
+              VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+              VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+              VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+          }
+      }
 
       ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, "one");
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, "two");
+      ValidateAllocaWrite(Testables.AllocaWrites, 1, "contained.one");
+      ValidateAllocaWrite(Testables.AllocaWrites, 2, "contained.two");
       ValidateAllocaWrite(Testables.AllocaWrites, 3, "after");
   }
 }
@@ -2177,7 +2501,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_1DArray) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
 
       const char* hlsl = R"(
 struct smallPayload
@@ -2197,20 +2522,33 @@ void main()
 )";
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
-      if (!Testables.OffsetAndSizes.empty()) {
+      if (!choice.IsOptimized) {
           VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
           VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes[0].countOfMembers);
           VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
           VERIFY_ARE_EQUAL(2 * 32, Testables.OffsetAndSizes[0].size);
       }
+      else {
+          VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes.size());
+          for (int i = 0; i < 2; i++) {
+              VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+              VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+              VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+          }
+      }
       VERIFY_ARE_EQUAL(2, Testables.AllocaWrites.size());
+
+      int Idx = 0;
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "Array[0]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "Array[1]");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_2DArray) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 struct smallPayload
 {
@@ -2233,20 +2571,37 @@ void main()
 )";
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
-      if (!Testables.OffsetAndSizes.empty()) {
+      if (!choice.IsOptimized) {
           VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
           VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes[0].countOfMembers);
           VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
           VERIFY_ARE_EQUAL(2 * 3 * 32, Testables.OffsetAndSizes[0].size);
       }
+      else {
+          VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes.size());
+          for (int i = 0; i < 6; i++) {
+              VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+              VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+              VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+          }
+      }
       VERIFY_ARE_EQUAL(6, Testables.AllocaWrites.size());
+
+      int Idx = 0;
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][0]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][1]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][2]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][0]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][1]");
+      ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][2]");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_EmbeddedArray) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 
 struct Contained
@@ -2277,17 +2632,25 @@ void main()
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty()) {
+      if (!choice.IsOptimized) {
           VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
           VERIFY_ARE_EQUAL(5, Testables.OffsetAndSizes[0].countOfMembers);
           VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
           VERIFY_ARE_EQUAL(5 * 32, Testables.OffsetAndSizes[0].size);
       }
+      else {
+          VERIFY_ARE_EQUAL(5, Testables.OffsetAndSizes.size());
+          for (int i = 0; i < 5; i++) {
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+            VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+            VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+          }
+      }
 
       ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, "array");
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, "array");
-      ValidateAllocaWrite(Testables.AllocaWrites, 3, "array");
+      ValidateAllocaWrite(Testables.AllocaWrites, 1, "contained.array[0]");
+      ValidateAllocaWrite(Testables.AllocaWrites, 2, "contained.array[1]");
+      ValidateAllocaWrite(Testables.AllocaWrites, 3, "contained.array[2]");
       ValidateAllocaWrite(Testables.AllocaWrites, 4, "after");
   }
 }
@@ -2295,7 +2658,9 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_FloatN) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
+      auto IsOptimized = choice.IsOptimized;
       const char* hlsl = R"(
 struct smallPayload
 {
@@ -2314,17 +2679,25 @@ void main()
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 + 32, Testables.OffsetAndSizes[0].size);
+      if (IsOptimized) {
+        VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes.size());
+        VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[0].countOfMembers);
+        VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[1].countOfMembers);
+        VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+        VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[0].size);
+        VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[1].offset);
+        VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[1].size);
+      }
+      else {
+        VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
+        VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes[0].countOfMembers);
+        VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+        VERIFY_ARE_EQUAL(32 + 32, Testables.OffsetAndSizes[0].size);
+      }
 
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      VERIFY_ARE_EQUAL(2, Testables.AllocaWrites.size());
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, (IsOptimized ? "" : "member0")); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member1")); // "memberN" until dbg.declare works
-
-      break; // don't run -O1 test until pointer types are dealt with by value-to-declare pass
+      VERIFY_ARE_EQUAL(Testables.AllocaWrites.size(), 2);
+      ValidateAllocaWrite(Testables.AllocaWrites, 0, "f2.x");
+      ValidateAllocaWrite(Testables.AllocaWrites, 1, "f2.y");
   }
 }
 
@@ -2332,7 +2705,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_SequentialFloatN) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 struct smallPayload
 {
@@ -2354,29 +2728,36 @@ void main()
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 * 6, Testables.OffsetAndSizes[0].size);
+      if (choice.IsOptimized) {
+        VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes.size());
+        for (int i = 0; i < 6; i++) {
+          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+          VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+          VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+        }
+      }
+      else {
+        VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
+        VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes[0].countOfMembers);
+        VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+        VERIFY_ARE_EQUAL(32 * 6, Testables.OffsetAndSizes[0].size);
+      }
 
       VERIFY_ARE_EQUAL(6, Testables.AllocaWrites.size());
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, (IsOptimized ? "" : "member0") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member1") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, (IsOptimized ? "" : "member2") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 3, (IsOptimized ? "" : "member0") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 4, (IsOptimized ? "" : "member1") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 5, (IsOptimized ? "" : "member2") ); // "memberN" until dbg.declare works
-
-      break; // don't run -O1 test until pointer types are dealt with by
-             // value-to-declare pass
+      ValidateAllocaWrite(Testables.AllocaWrites, 0, "color.x");
+      ValidateAllocaWrite(Testables.AllocaWrites, 1, "color.y");
+      ValidateAllocaWrite(Testables.AllocaWrites, 2, "color.z");
+      ValidateAllocaWrite(Testables.AllocaWrites, 3, "dir.x");
+      ValidateAllocaWrite(Testables.AllocaWrites, 4, "dir.y");
+      ValidateAllocaWrite(Testables.AllocaWrites, 5, "dir.z");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_EmbeddedFloatN) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 
 struct Embedded
@@ -2403,26 +2784,33 @@ void main()
 
       auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(3, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 * 3, Testables.OffsetAndSizes[0].size);
+      if (choice.IsOptimized) {
+        VERIFY_ARE_EQUAL(3, Testables.OffsetAndSizes.size());
+        for (int i = 0; i < 3; i++) {
+          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+          VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+          VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+        }
+      }
+      else {
+        VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
+        VERIFY_ARE_EQUAL(3, Testables.OffsetAndSizes[0].countOfMembers);
+        VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
+        VERIFY_ARE_EQUAL(32 * 3, Testables.OffsetAndSizes[0].size);
+      }
 
       VERIFY_ARE_EQUAL(3, Testables.AllocaWrites.size());
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member0"));
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, (IsOptimized ? "" : "member1"));
-
-      break; // don't run -O1 test until pointer types are dealt with by
-             // value-to-declare pass
+      ValidateAllocaWrite(Testables.AllocaWrites, 0, "i32");
+      ValidateAllocaWrite(Testables.AllocaWrites, 1, "e.f2.x");
+      ValidateAllocaWrite(Testables.AllocaWrites, 2, "e.f2.y");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_Matrix) {
   if (m_ver.SkipDxilVersion(1, 5)) return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 struct smallPayload
 {
@@ -2443,9 +2831,13 @@ void main()
       // Can't test member iterator until dbg.declare instructions are emitted when structs
       // contain pointers-to-pointers
       VERIFY_ARE_EQUAL(16, Testables.AllocaWrites.size());
-      for (int i = 0; i < 16; ++i)
+      for (int i = 0; i < 4; ++i)
       {
-          ValidateAllocaWrite(Testables.AllocaWrites, i, "");
+        for (int j = 0; j < 4; ++j)
+        {
+          std::string expected = std::string("mat._") + std::to_string(i + 1) + std::to_string(j + 1);
+          ValidateAllocaWrite(Testables.AllocaWrites, i*4 + j, expected.c_str());
+        }
       }
   }
 }
@@ -2454,7 +2846,8 @@ TEST_F(PixTest, PixStructAnnotation_MemberFunction) {
   if (m_ver.SkipDxilVersion(1, 5))
     return;
 
-  for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
       const char* hlsl = R"(
 
 RWStructuredBuffer<float> floatRWUAV: register(u0);
@@ -2556,12 +2949,9 @@ void main()
 
 
 )";
-      // Probably related to PIX bug #29512388. Coverage validation awaiting that fix for optimized shaders
-      bool validateCoverage = (wcscmp(optimization, L"-Od") == 0);
+      auto Testables = TestStructAnnotationCase(hlsl, optimization, true);
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization, validateCoverage);
-      // Can't test member iterator until dbg.declare instructions are emitted when structs
-      // contain pointers-to-pointers
+      // TODO: Make 'this' work
 
       // Can't validate # of writes: rel and dbg are different
       //VERIFY_ARE_EQUAL(43, Testables.AllocaWrites.size());
@@ -2577,7 +2967,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_BigMess) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
 
-    for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+        auto optimization = choice.Flag;
 
         const char* hlsl = R"(
 
@@ -2637,7 +3028,7 @@ void main()
 )";
 
         auto Testables = TestStructAnnotationCase(hlsl, optimization);
-        if (!Testables.OffsetAndSizes.empty()) {
+        if (!choice.IsOptimized) {
             VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
             VERIFY_ARE_EQUAL(15, Testables.OffsetAndSizes[0].countOfMembers);
             VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
@@ -2645,14 +3036,65 @@ void main()
             constexpr uint32_t EmbeddedStructBitSize = 32 * 5;
             VERIFY_ARE_EQUAL(3 * 32 + EmbeddedStructBitSize + 64 + 16 + 16/*alignment for next field*/ + BigStructBitSize * 2 + 32 + 32/*align to max align*/, Testables.OffsetAndSizes[0].size);
         }
+        else {
+            VERIFY_ARE_EQUAL(15, Testables.OffsetAndSizes.size());
+
+            // First 8 members
+            for (int i = 0; i < 8; i++) {
+              VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[i].countOfMembers);
+              VERIFY_ARE_EQUAL(i * 32, Testables.OffsetAndSizes[i].offset);
+              VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[i].size);
+            }
+
+            // bigOne
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[8].countOfMembers);
+            VERIFY_ARE_EQUAL(256, Testables.OffsetAndSizes[8].offset);
+            VERIFY_ARE_EQUAL(64, Testables.OffsetAndSizes[8].size);
+
+            // littleOne
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[9].countOfMembers);
+            VERIFY_ARE_EQUAL(320, Testables.OffsetAndSizes[9].offset);
+            VERIFY_ARE_EQUAL(16, Testables.OffsetAndSizes[9].size);
+
+            // Each member of BigStruct[2]
+            for (int i = 0; i < 4; i++) {
+              int idx = i + 10;
+              VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[idx].countOfMembers);
+              VERIFY_ARE_EQUAL(384 + i*64, Testables.OffsetAndSizes[idx].offset);
+              VERIFY_ARE_EQUAL(64, Testables.OffsetAndSizes[idx].size);
+            }
+
+            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[14].countOfMembers);
+            VERIFY_ARE_EQUAL(640, Testables.OffsetAndSizes[14].offset);
+            VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[14].size);
+        }
+
         VERIFY_ARE_EQUAL(15, Testables.AllocaWrites.size());
+
+        size_t Index = 0;
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "dummy");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "vertexCount");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "primitiveCount");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "embeddedStruct.OneInt");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "embeddedStruct.TwoDArray[0][0]");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "embeddedStruct.TwoDArray[0][1]");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "embeddedStruct.TwoDArray[1][0]");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "embeddedStruct.TwoDArray[1][1]");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigOne");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "littleOne");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[0].bigInt");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[0].bigDouble");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[1].bigInt");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[1].bigDouble");
+        ValidateAllocaWrite(Testables.AllocaWrites, Index++, "lastCheck");
     }
 }
 
 TEST_F(PixTest, PixStructAnnotation_AlignedFloat4Arrays) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
 
-    for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+        auto optimization = choice.Flag;
 
         const char* hlsl = R"(
 
@@ -2687,11 +3129,12 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_Inheritance) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
 
-    for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
+      auto IsOptimized = choice.IsOptimized;
 
       // don't run -Od test until -Od inheritance is fixed (#3274:
       // https://github.com/microsoft/DirectXShaderCompiler/issues/3274)
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
       if (!IsOptimized)
         continue;
 
@@ -2701,8 +3144,9 @@ struct Base
 {
     float floatValue;
 };
+typedef Base BaseTypedef;
 
-struct Derived : Base
+struct Derived : BaseTypedef
 {
 	int intValue;
 };
@@ -2727,7 +3171,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_ResourceAsMember) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
 
-    for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
 
         const char* hlsl = R"(
 
@@ -2768,7 +3213,8 @@ void main()
 TEST_F(PixTest, PixStructAnnotation_WheresMyDbgValue) {
     if (m_ver.SkipDxilVersion(1, 5)) return;
 
-    for (auto const* optimization : OptimizationChoices) {
+    for (auto choice : OptimizationChoices) {
+      auto optimization = choice.Flag;
 
         const char* hlsl = R"(
 

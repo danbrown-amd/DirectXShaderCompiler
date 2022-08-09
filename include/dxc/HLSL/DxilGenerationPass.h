@@ -134,4 +134,10 @@ void initializeDxilNoOptSimplifyInstructionsPass(llvm::PassRegistry&);
 ModulePass *createDxilMutateResourceToHandlePass();
 void initializeDxilMutateResourceToHandlePass(llvm::PassRegistry&);
 
+ModulePass *createDxilDeleteRedundantDebugValuesPass();
+void initializeDxilDeleteRedundantDebugValuesPass(llvm::PassRegistry&);
+
+FunctionPass *createDxilSimpleGVNEliminateRegionPass();
+void initializeDxilSimpleGVNEliminateRegionPass(llvm::PassRegistry&);
+
 }

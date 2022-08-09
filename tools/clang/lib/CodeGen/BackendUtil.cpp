@@ -43,6 +43,7 @@
 #include <memory>
 #include "dxc/HLSL/DxilGenerationPass.h" // HLSL Change
 #include "dxc/HLSL/HLMatrixLowerPass.h"  // HLSL Change
+#include "dxc/Support/Global.h" // HLSL Change
 
 using namespace clang;
 using namespace llvm;
@@ -92,6 +93,7 @@ private:
     if (!PerModulePasses) {
       PerModulePasses = new legacy::PassManager();
       PerModulePasses->HLSLPrintAfterAll = this->CodeGenOpts.HLSLPrintAfterAll;
+      PerModulePasses->HLSLPrintAfter = this->CodeGenOpts.HLSLPrintAfter;
       PerModulePasses->TrackPassOS = &PerModulePassesConfigOS;
       PerModulePasses->add(
           createTargetTransformInfoWrapperPass(getTargetIRAnalysis()));
@@ -103,6 +105,7 @@ private:
     if (!PerFunctionPasses) {
       PerFunctionPasses = new legacy::FunctionPassManager(TheModule);
       PerFunctionPasses->HLSLPrintAfterAll = this->CodeGenOpts.HLSLPrintAfterAll;
+      PerFunctionPasses->HLSLPrintAfter = this->CodeGenOpts.HLSLPrintAfter;
       PerFunctionPasses->TrackPassOS = &PerFunctionPassesConfigOS;
       PerFunctionPasses->add(
           createTargetTransformInfoWrapperPass(getTargetIRAnalysis()));
@@ -344,7 +347,10 @@ void EmitAssemblyHelper::CreatePasses() {
                         !CodeGenOpts.HLSLOptimizationToggles.count("debug-nops") ||
                         CodeGenOpts.HLSLOptimizationToggles.find("debug-nops")->second;
 
-  PMBuilder.HLSLEnableLifetimeMarkers = CodeGenOpts.HLSLEnableLifetimeMarkers;
+  PMBuilder.HLSLEnableLifetimeMarkers =
+      CodeGenOpts.HLSLEnableLifetimeMarkers &&
+      (!CodeGenOpts.HLSLOptimizationToggles.count("lifetime-markers") ||
+       CodeGenOpts.HLSLOptimizationToggles.find("lifetime-markers")->second);
   // HLSL Change - end
 
   PMBuilder.DisableUnitAtATime = !CodeGenOpts.UnitAtATime;
@@ -757,7 +763,15 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
                               raw_pwrite_stream *OS) {
   EmitAssemblyHelper AsmHelper(Diags, CGOpts, TOpts, LOpts, M);
 
-  AsmHelper.EmitAssembly(Action, OS);
+
+  try { // HLSL Change Starts
+    // Catch any fatal errors during optimization passes here
+    // so that future passes can be skipped.
+    AsmHelper.EmitAssembly(Action, OS);
+  } catch (const ::hlsl::Exception &hlslException) {
+    Diags.Report(Diags.getCustomDiagID(DiagnosticsEngine::Error, "%0\n"))
+        << StringRef(hlslException.what());
+  } // HLSL Change Ends
 
   // If an optional clang TargetInfo description string was passed in, use it to
   // verify the LLVM TargetMachine's DataLayout.

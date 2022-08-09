@@ -445,6 +445,10 @@ ParsedType Sema::getTypeName(const IdentifierInfo &II, SourceLocation NameLoc,
     (void)DiagnoseUseOfDecl(IDecl, NameLoc);
     if (!HasTrailingDot)
       T = Context.getObjCInterfaceType(IDecl);
+  } else if (getLangOpts().HLSL) { // HLSL - omit empty template argument lists
+    if (ClassTemplateDecl *TD = dyn_cast<ClassTemplateDecl>(IIDecl))
+      if (TypeDecl *DefaultSpec = getHLSLDefaultSpecialization(TD))
+        T = Context.getTypeDeclType(DefaultSpec); // HLSL Change end
   }
 
   if (T.isNull()) {
@@ -602,7 +606,7 @@ void Sema::DiagnoseUnknownTypeName(IdentifierInfo *&II,
     return;
   }
 
-  if (getLangOpts().CPlusPlus && !getLangOpts().HLSL) {  // HLSL Change
+  if (getLangOpts().CPlusPlus) {
     // See if II is a class template that the user forgot to pass arguments to.
     UnqualifiedId Name;
     Name.setIdentifier(II, IILoc);
@@ -11709,7 +11713,7 @@ Decl *Sema::ActOnTag(Scope *S, unsigned TagSpec, TagUseKind TUK,
   }
 
   // HLSL Change Starts
-  if (getLangOpts().HLSLVersion == 2015 && TUK == TUK_Declaration) {
+  if (getLangOpts().HLSLVersion == hlsl::LangStd::v2015 && TUK == TUK_Declaration) {
     Diag(NameLoc, diag::err_hlsl_unsupported_construct)
         << "struct declaration without definition";
   }
@@ -13664,7 +13668,8 @@ EnumConstantDecl *Sema::CheckEnumConstant(EnumDecl *Enum,
     else {
       SourceLocation ExpLoc;
       // HLSL Change - check constant expression for enum
-      if ((getLangOpts().HLSLVersion >= 2017 || getLangOpts().CPlusPlus11) &&
+      if ((getLangOpts().HLSLVersion >= hlsl::LangStd::v2017 ||
+           getLangOpts().CPlusPlus11) &&
           Enum->isFixed() && !getLangOpts().MSVCCompat) {
         // C++11 [dcl.enum]p5: If the underlying type is fixed, [...] the
         // constant-expression in the enumerator-definition shall be a converted
@@ -13678,8 +13683,8 @@ EnumConstantDecl *Sema::CheckEnumConstant(EnumDecl *Enum,
         else
           Val = Converted.get();
       } else if (!Val->isValueDependent() &&
-                 !(Val = VerifyIntegerConstantExpression(Val,
-                                                         &EnumVal).get())) {
+                 !(Val =
+                       VerifyIntegerConstantExpression(Val, &EnumVal).get())) {
         // C99 6.7.2.2p2: Make sure we have an integer constant expression.
       } else {
         if (Enum->isFixed()) {

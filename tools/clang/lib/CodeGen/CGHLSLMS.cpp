@@ -219,6 +219,7 @@ private:
 
   std::unordered_map<Constant*, DxilFieldAnnotation> m_ConstVarAnnotationMap;
   StringSet<> m_PreciseOutputSet;
+  DenseSet<Value *> mismatchGLCArgSet;
 
   DenseMap<Function*, ScopeInfo> m_ScopeMap;
   ScopeInfo *GetScopeInfo(Function *F);
@@ -295,7 +296,13 @@ public:
                           ArrayRef<const Attr *> Attrs) override;
   void MarkPotentialResourceTemp(CodeGenFunction &CGF, llvm::Value *V,
                                  clang::QualType QaulTy) override;
-  void FinishAutoVar(CodeGenFunction &CGF, const VarDecl &D, llvm::Value *V) override;
+  void FinishAutoVar(CodeGenFunction &CGF, const VarDecl &D,
+                     llvm::Value *V) override;
+  const clang::Expr *CheckReturnStmtGLCMismatch(
+      CodeGenFunction &CGF, const Expr *RV, const clang::ReturnStmt &S,
+      clang::QualType FnRetTy,
+      const std::function<void(const VarDecl *, llvm::Value *)> &TmpArgMap)
+      override;
   void MarkIfStmt(CodeGenFunction &CGF, BasicBlock *endIfBB) override;
   void MarkSwitchStmt(CodeGenFunction &CGF, SwitchInst *switchInst,
                       BasicBlock *endSwitch) override;
@@ -381,6 +388,7 @@ CGMSHLSLRuntime::CGMSHLSLRuntime(CodeGenModule &CGM)
   opts.bDisableOptimizations = CGM.getCodeGenOpts().DisableLLVMOpts;
   opts.bLegacyCBufferLoad = !CGM.getCodeGenOpts().HLSLNotUseLegacyCBufLoad;
   opts.bAllResourcesBound = CGM.getCodeGenOpts().HLSLAllResourcesBound;
+  opts.bResMayAlias = CGM.getCodeGenOpts().HLSLResMayAlias;
   opts.PackingStrategy = CGM.getCodeGenOpts().HLSLSignaturePackingStrategy;
   opts.bLegacyResourceReservation = CGM.getCodeGenOpts().HLSLLegacyResourceReservation;
   opts.bForceZeroStoreLifetimes = CGM.getCodeGenOpts().HLSLForceZeroStoreLifetimes;
@@ -899,7 +907,8 @@ static unsigned AlignBaseOffset(unsigned baseOffset, unsigned size, QualType Ty,
   }
   if (BT) {
     if (BT->getKind() == clang::BuiltinType::Kind::Double ||
-        BT->getKind() == clang::BuiltinType::Kind::LongLong)
+        BT->getKind() == clang::BuiltinType::Kind::LongLong ||
+        BT->getKind() == clang::BuiltinType::Kind::ULongLong)
       scalarSizeInBytes = 8;
     else if (BT->getKind() == clang::BuiltinType::Kind::Half ||
              BT->getKind() == clang::BuiltinType::Kind::Short ||
@@ -1000,7 +1009,8 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
     if (Field->isBitField()) {
       // TODO(?): Consider refactoring, as this branch duplicates much
       // of the logic of CGRecordLowering::accumulateBitFields().
-      DXASSERT(CGM.getLangOpts().HLSLVersion > 2015, "We should have already ensured we have no bitfields.");
+      DXASSERT(CGM.getLangOpts().HLSLVersion > hlsl::LangStd::v2015,
+               "We should have already ensured we have no bitfields.");
       CodeGenTypes &Types = CGM.getTypes();
       ASTContext &Context = Types.getContext();
       const ASTRecordLayout &Layout = Context.getASTRecordLayout(RD);
@@ -1567,6 +1577,12 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   }
 
   const ShaderModel *SM = m_pHLModule->GetShaderModel();
+  if (auto *Attr = FD->getAttr<HLSLWaveOpsIncludeHelperLanesAttr>()) {
+    if (SM->IsSM67Plus() &&
+        (funcProps->shaderKind == DXIL::ShaderKind::Pixel ||
+         (isEntry && SM->GetKind() == DXIL::ShaderKind::Pixel)))
+      F->addFnAttr(DXIL::kWaveOpsIncludeHelperLanesString);
+  }
   if (isEntry) {
     funcProps->shaderKind = SM->GetKind();
     if (funcProps->shaderKind == DXIL::ShaderKind::Mesh) {
@@ -2458,7 +2474,7 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   }
 
   // Add target-dependent experimental function attributes
-  for (const auto &Attr : FD->specific_attrs<HLSLExperimentalAttr>()) {
+  for (const HLSLExperimentalAttr *Attr : FD->specific_attrs<HLSLExperimentalAttr>()) {
     F->addFnAttr(Twine("exp-", Attr->getName()).str(), Attr->getValue());
   }
 
@@ -2591,13 +2607,29 @@ void CGMSHLSLRuntime::AddControlFlowHint(CodeGenFunction &CGF, const Stmt &S,
   }
 }
 
-void CGMSHLSLRuntime::MarkPotentialResourceTemp(CodeGenFunction &CGF, llvm::Value *V,
-                                           clang::QualType QualTy) {
+void CGMSHLSLRuntime::MarkPotentialResourceTemp(CodeGenFunction &CGF,
+                                                llvm::Value *V,
+                                                clang::QualType QualTy) {
   // Save object properties for temp that may be created for
   // call args, return value, or agg expr copy.
   if (objectProperties.GetResource(V).isValid())
     return;
   AddValToPropertyMap(V, QualTy);
+}
+
+static bool isGLCMismatch(QualType Ty0, QualType Ty1, const Expr *SrcExp,
+                          clang::SourceLocation Loc, DiagnosticsEngine &Diags) {
+  if (HasHLSLGloballyCoherent(Ty0) == HasHLSLGloballyCoherent(Ty1))
+    return false;
+  if (const CastExpr *Cast = dyn_cast<CastExpr>(SrcExp)) {
+    // Skip flat conversion which is for createHandleFromHeap.
+    if (Cast->getCastKind() == CastKind::CK_FlatConversion)
+      return false;
+  }
+  unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Warning,
+                                          "global coherent mismatch");
+  Diags.Report(Loc, DiagID);
+  return true;
 }
 
 void CGMSHLSLRuntime::FinishAutoVar(CodeGenFunction &CGF, const VarDecl &D,
@@ -2612,6 +2644,57 @@ void CGMSHLSLRuntime::FinishAutoVar(CodeGenFunction &CGF, const VarDecl &D,
   AddTypeAnnotation(D.getType(), typeSys, arrayEltSize);
   // Save object properties for local variables.
   AddValToPropertyMap(V, D.getType());
+
+  if (D.hasInit()) {
+    if (isGLCMismatch(D.getType(), D.getInit()->getType(), D.getInit(),
+                      D.getLocation(), CGM.getDiags())) {
+      objectProperties.updateGLC(V);
+    }
+  }
+}
+
+const clang::Expr *CGMSHLSLRuntime::CheckReturnStmtGLCMismatch(
+    CodeGenFunction &CGF, const Expr *RV, const clang::ReturnStmt &S,
+    clang::QualType FnRetTy,
+    const std::function<void(const VarDecl *, llvm::Value *)> &TmpArgMap) {
+  if (!isGLCMismatch(RV->getType(), FnRetTy, RV, S.getReturnLoc(),
+                     CGM.getDiags())) {
+    return RV;
+  }
+  const FunctionDecl *FD = cast<FunctionDecl>(CGF.CurFuncDecl);
+  // create temp Var
+  VarDecl *tmpArg =
+      VarDecl::Create(CGF.getContext(), const_cast<FunctionDecl *>(FD),
+                      SourceLocation(), SourceLocation(),
+                      /*IdentifierInfo*/ nullptr, FnRetTy,
+                      CGF.getContext().getTrivialTypeSourceInfo(FnRetTy),
+                      StorageClass::SC_Auto);
+
+  // Aggregate type will be indirect param convert to pointer type.
+  // So don't update to ReferenceType, use RValue for it.
+  const DeclRefExpr *tmpRef = DeclRefExpr::Create(
+      CGF.getContext(), NestedNameSpecifierLoc(), SourceLocation(), tmpArg,
+      /*enclosing*/ false, tmpArg->getLocation(), FnRetTy, VK_RValue);
+
+  // create alloc for the tmp arg
+  Value *tmpArgAddr = nullptr;
+  BasicBlock *InsertBlock = CGF.Builder.GetInsertBlock();
+  Function *F = InsertBlock->getParent();
+
+  // Make sure the alloca is in entry block to stop inline create stacksave.
+  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(F));
+  tmpArgAddr = AllocaBuilder.CreateAlloca(CGF.ConvertTypeForMem(FnRetTy));
+
+  // add it to local decl map
+  TmpArgMap(tmpArg, tmpArgAddr);
+
+  LValue argLV = CGF.EmitLValue(RV);
+  Value *argAddr = argLV.getAddress();
+
+  // Annotate return value when mismatch with function return type.
+  DxilResourceProperties RP = BuildResourceProperty(RV->getType());
+  CopyAndAnnotateResourceArgument(argAddr, tmpArgAddr, RP, *m_pHLModule, CGF);
+  return tmpRef;
 }
 
 hlsl::InterpolationMode CGMSHLSLRuntime::GetInterpMode(const Decl *decl,
@@ -2700,8 +2783,17 @@ void CGMSHLSLRuntime::addResource(Decl *D) {
       AddValToPropertyMap(GV, VD->getType());
     }
     // skip decl has init which is resource.
-    if (VD->hasInit() && resClass != DXIL::ResourceClass::Invalid)
+    if (VD->hasInit() && resClass != DXIL::ResourceClass::Invalid) {
+
+      if (resClass == DXIL::ResourceClass::UAV) {
+        if (isGLCMismatch(VD->getType(), VD->getInit()->getType(),
+                          VD->getInit(), D->getLocation(), CGM.getDiags())) {
+          GlobalVariable *GV = cast<GlobalVariable>(CGM.GetAddrOfGlobalVar(VD));
+          objectProperties.updateGLC(GV);
+        }
+      }
       return;
+    }
     // skip static global.
     if (!VD->hasExternalFormalLinkage()) {
       if (VD->hasInit() && VD->getType().isConstQualified()) {
@@ -3581,19 +3673,21 @@ uint32_t CGMSHLSLRuntime::AddConstantBufferView(VarDecl *D) {
   CB->SetRangeSize(1);
 
   if (Ty->isArrayType()) {
-    if (!Ty->isIncompleteArrayType()) {
-      unsigned arraySize = 1;
-      while (Ty->isArrayType()) {
-        Ty = Ty->getCanonicalTypeUnqualified();
-        const ConstantArrayType *AT = cast<ConstantArrayType>(Ty);
-        arraySize *= AT->getSize().getLimitedValue();
-        Ty = AT->getElementType();
-      }
-      CB->SetRangeSize(arraySize);
-    } else {
+    unsigned incompleteSize = 0;
+    // The initial array may be unbound
+    if (Ty->isIncompleteArrayType()) {
       Ty = QualType(Ty->getArrayElementTypeNoTypeQual(),0);
-      CB->SetRangeSize(UINT_MAX);
+      incompleteSize = UINT_MAX;
     }
+    DXASSERT(!Ty->isIncompleteArrayType(), "Unbound array found after first axis");
+    unsigned arraySize = 1;
+    while (Ty->isArrayType()) {
+      Ty = Ty->getCanonicalTypeUnqualified();
+      const ConstantArrayType *AT = cast<ConstantArrayType>(Ty);
+      arraySize *= AT->getSize().getLimitedValue();
+      Ty = AT->getElementType();
+    }
+    CB->SetRangeSize(std::max(arraySize, incompleteSize));
     CB->SetIsArray();
   }
 
@@ -3754,7 +3848,8 @@ RValue CGMSHLSLRuntime::EmitHLSLBuiltinCallExpr(CodeGenFunction &CGF,
           StringRef intrinsicGroup;
           hlsl::GetIntrinsicOp(FD, intrinsicOpcode, intrinsicGroup);
           IntrinsicOp opcode = static_cast<IntrinsicOp>(intrinsicOpcode);
-          if (Value *Result = TryEvalIntrinsic(CI, opcode, CGM.getLangOpts().HLSLVersion)) {
+          if (Value *Result =
+                  TryEvalIntrinsic(CI, opcode, CGM.getLangOpts().HLSLVersion)) {
             RV = RValue::get(Result);
           }
         }
@@ -4748,6 +4843,10 @@ void CGMSHLSLRuntime::EmitHLSLDiscard(CodeGenFunction &CGF) {
 // If the block uses values that are wave-sensitive, it needs to stay in the loop to prevent optimizations
 // that might produce incorrect results by ignoring the volatile aspect of wave operation results.
 BranchInst *CGMSHLSLRuntime::EmitHLSLCondBreak(CodeGenFunction &CGF, Function *F, BasicBlock *DestBB, BasicBlock *AltBB) {
+  // Skip if unreachable
+  if (!CGF.HaveInsertPoint())
+    return nullptr;
+
   // If not a wave-enabled stage, we can keep everything unconditional as before
   if (!m_pHLModule->GetShaderModel()->IsPS() && !m_pHLModule->GetShaderModel()->IsCS() &&
       !m_pHLModule->GetShaderModel()->IsLib()) {
@@ -5905,6 +6004,19 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionInit(
     const Expr *Arg = E->getArg(i+ArgsToSkip);
     QualType ParamTy = Param->getType().getNonReferenceType();
     bool isObject = dxilutil::IsHLSLObjectType(CGF.ConvertTypeForMem(ParamTy));
+    bool bAnnotResource = false;
+    if (isObject) {
+      if (isGLCMismatch(Param->getType(), Arg->getType(), Arg,
+                        Arg->getExprLoc(), CGM.getDiags())) {
+        // NOTE: if function is noinline, resource parameter is not allowed.
+        // Here assume function will be always inlined.
+        // This can only take care resource as parameter. When parameter is
+        // struct with resource member, glc cannot mismatch because the
+        // struct type will always match.
+        // Add annotate handle here.
+        bAnnotResource = true;
+      }
+    }
     bool isVector = hlsl::IsHLSLVecType(ParamTy);
     bool isArray = ParamTy->isArrayType();
     // Check for array of matrix
@@ -5954,7 +6066,8 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionInit(
         // Must be object
         DXASSERT(isObject, "otherwise, flow condition changed, breaking assumption");
         // in-only objects should be skipped to preserve previous behavior.
-        continue;
+        if (!bAnnotResource)
+          continue;
       }
     }
 
@@ -5992,7 +6105,7 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionInit(
       if (argLV.isSimple())
         argAddr = argLV.getAddress();
 
-      bool mustCopy = false;
+      bool mustCopy = bAnnotResource;
 
       // If matrix orientation changes, we must copy here
       // TODO: A high level intrinsic for matrix array copy with orientation
@@ -6129,6 +6242,11 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionInit(
                               idxList, ArgTy, ParamTy,
                               argAddr->getType());
       }
+    } else if (bAnnotResource) {
+      DxilResourceProperties RP = BuildResourceProperty(Arg->getType());
+      CopyAndAnnotateResourceArgument(argAddr, tmpArgAddr, RP, *m_pHLModule,
+                                      CGF);
+      mismatchGLCArgSet.insert(tmpArgAddr);
     }
   }
 }
@@ -6193,8 +6311,9 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionCopyBack(
                               idxList, ParamTy, ArgTy,
                               argLV.getAddress()->getType());
       }
-    } else
+    } else if (mismatchGLCArgSet.find(tmpArgAddr) == mismatchGLCArgSet.end()) {
       tmpArgAddr->replaceAllUsesWith(argLV.getAddress());
+    }
   }
 
   for (LValue &tmpLV : lifetimeCleanupList) {

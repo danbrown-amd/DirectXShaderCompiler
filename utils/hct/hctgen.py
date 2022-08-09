@@ -23,7 +23,8 @@ parser.add_argument('mode', choices=['HLSLIntrinsicOp',
                                      'DxilPIXPasses',
                                      'DxcDisassembler',
                                      'DxilCounters',
-                                     'DxilMetadata'
+                                     'DxilMetadata',
+                                     'RDAT_LibraryTypes'
                                      ])
 parser.add_argument('--output', required=True)
 parser.add_argument('--input', default=None)
@@ -51,6 +52,9 @@ def writeCodeTag(args):
   return 0
   
 def openOutput(args):
+  outputDir = os.path.dirname(os.path.realpath(args.output))
+  if not os.path.exists(outputDir):
+    os.makedirs(outputDir)
   return open(args.output, 'w', newline=getNewline(args))
 
 def printHeader(out, filename):

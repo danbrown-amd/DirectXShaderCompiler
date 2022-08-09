@@ -699,6 +699,11 @@ ExprResult Sema::DefaultLvalueConversion(Expr *E) {
     return ExprError();
   }
 
+  // HLSL Change Begin
+  // For HLSL we should not strip qualifiers for array types.
+  bool StripQualifiers = getLangOpts().HLSL ? !T->isArrayType() : true;
+  // HLSL Change End
+
   // C++ [conv.lval]p1:
   //   [...] If T is a non-class type, the type of the prvalue is the
   //   cv-unqualified version of T. Otherwise, the type of the
@@ -708,7 +713,7 @@ ExprResult Sema::DefaultLvalueConversion(Expr *E) {
   //   If the lvalue has qualified type, the value has the unqualified
   //   version of the type of the lvalue; otherwise, the value has the
   //   type of the lvalue.
-  if (T.hasQualifiers())
+  if (T.hasQualifiers() && StripQualifiers) // HLSL Change don't unqualify
     T = T.getUnqualifiedType();
 
   UpdateMarkingForLValueToRValue(E);
@@ -2331,9 +2336,19 @@ Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
       return BuildPossibleImplicitMemberExpr(SS, TemplateKWLoc,
                                              R, TemplateArgs);
   }
-
+  // HLSL Change Begin: Allow templates without empty argument list if default
+  // arguments are provided.
+  if (getLangOpts().HLSL && R.isSingleResult()) {
+    if (TemplateDecl *Template = dyn_cast<TemplateDecl>(R.getFoundDecl())) {
+      if (Template->getTemplateParameters()->getMinRequiredArguments() == 0) {
+        TemplateArgsBuffer.setLAngleLoc(NameLoc);
+        TemplateArgsBuffer.setRAngleLoc(NameLoc);
+        TemplateArgs = &TemplateArgsBuffer;
+      }
+    }
+  }
+  // HLSL Change End
   if (TemplateArgs || TemplateKWLoc.isValid()) {
-
     // In C++1y, if this is a variable template id, then check it
     // in BuildTemplateIdExpr().
     // The single lookup result must be a variable template declaration.
@@ -4267,6 +4282,10 @@ Sema::CreateBuiltinArraySubscriptExpr(Expr *Base, SourceLocation LLoc,
       BaseExpr = LHSExp;
       IndexExpr = RHSExp;
       ResultType = LHSTy->getAsArrayTypeUnsafe()->getElementType();
+      // We need to make sure to preserve qualifiers on array types, since these
+      // are in effect references.
+      if (LHSTy.hasQualifiers())
+        ResultType.setLocalFastQualifiers(LHSTy.getQualifiers().getFastQualifiers());
     } else {
     // HLSL Change Ends
       Diag(LHSExp->getLocStart(), diag::ext_subscript_non_lvalue) <<
@@ -10392,9 +10411,9 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
 
   // HLSL Change Starts
   // Handle HLSL binary operands differently
-  if (getLangOpts().HLSL &&
+  if ((getLangOpts().HLSL &&
           (!getLangOpts().EnableOperatorOverloading ||
-           !hlsl::IsUserDefinedRecordType(LHSExpr->getType())) ||
+           !hlsl::IsUserDefinedRecordType(LHSExpr->getType()))) ||
       !hlsl::DoesTypeDefineOverloadedOperator(
           LHSExpr->getType(), clang::BinaryOperator::getOverloadedOperator(Opc),
           RHSExpr->getType())) {

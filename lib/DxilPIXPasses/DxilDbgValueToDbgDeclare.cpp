@@ -334,10 +334,10 @@ static OffsetInBits SplitValue(
     for (unsigned i = 0; i < ArrTy->getNumElements(); ++i)
     {
       CurrentOffset = SplitValue(
-          B.CreateExtractValue(V, {i}),
-          CurrentOffset,
-          Values,
-          B);
+        B.CreateExtractValue(V, {i}),
+        CurrentOffset,
+        Values,
+        B);
     }
   }
   else if (auto *StTy = llvm::dyn_cast<llvm::StructType>(VTy))
@@ -402,23 +402,46 @@ bool DxilDbgValueToDbgDeclare::runOnModule(
     llvm::Module &M
 )
 {
-  auto *DbgValueFn =
-      llvm::Intrinsic::getDeclaration(&M, llvm::Intrinsic::dbg_value);
+  hlsl::DxilModule &DM = M.GetOrCreateDxilModule();
 
   bool Changed = false;
-  for (auto it = DbgValueFn->user_begin(); it != DbgValueFn->user_end();)
-  {
-    llvm::User *User = *it++;
 
-    if (auto *DbgValue = llvm::dyn_cast<llvm::DbgValueInst>(User))
-    {
-      llvm::Value *V = DbgValue->getValue();
-      if (PIXPassHelpers::IsAllocateRayQueryInstruction(V)) {
-          continue;
+  auto entryPoints = DM.GetExportedFunctions();
+  for (auto &fn : entryPoints) {
+    // #DSLTodo: We probably need to merge the list of variables for each export
+    // into one set so that WinPIX shader debugging can follow a thread through
+    // any function within a given module. (Unless PIX chooses to launch a new
+    // debugging session whenever control passes from one function to another.)
+    // For now, it's sufficient to treat each exported function as having
+    // completely separate variables by clearing this member:
+    m_Registers.clear();
+    // Note: they key problem here is variables in common functions called by
+    // multiple exported functions. The DILocalVariables in the common function
+    // will be exactly the same objects no matter which export called the common
+    // function, so the instrumentation here gets a bit confused that the same
+    // variable is present in two functions and ends up pointing one function
+    // to allocas in another function. (This is easy to repro: comment out the
+    // above clear(), and run PixTest::PixStructAnnotation_Lib_DualRaygen.)
+    // Not sure what the right path forward is: might be that we have to tag
+    // m_Registers with the exported function, and maybe write out a function
+    // identifier during debug instrumentation...
+    auto &blocks = fn->getBasicBlockList();
+    for (auto &block : blocks) {
+      std::vector<Instruction *> instructions;
+      for (auto &instruction : block) {
+        instructions.push_back(&instruction);
       }
-      Changed = true;
-      handleDbgValue(M, DbgValue);
-      DbgValue->eraseFromParent();
+      for (auto & instruction : instructions) {
+        if (auto *DbgValue = llvm::dyn_cast<llvm::DbgValueInst>(instruction)) {
+          llvm::Value *V = DbgValue->getValue();
+          if (PIXPassHelpers::IsAllocateRayQueryInstruction(V)) {
+            continue;
+          }
+          Changed = true;
+          handleDbgValue(M, DbgValue);
+          DbgValue->eraseFromParent();
+        }
+      }
     }
   }
   return Changed;
@@ -628,6 +651,21 @@ static llvm::DIType* FindStructMemberTypeAtOffset(llvm::DICompositeType* Ty,
     return nullptr;
 }
 
+static bool IsDITypePointer(DIType *DTy, const llvm::DITypeIdentifierMap &EmptyMap) {
+  DIDerivedType *DerivedTy = dyn_cast<DIDerivedType>(DTy);
+  if (!DerivedTy) return false;
+  switch (DerivedTy->getTag()) {
+  case llvm::dwarf::DW_TAG_pointer_type:
+    return true;
+  case llvm::dwarf::DW_TAG_typedef:
+  case llvm::dwarf::DW_TAG_const_type:
+  case llvm::dwarf::DW_TAG_restrict_type:
+  case llvm::dwarf::DW_TAG_reference_type:
+    return IsDITypePointer(DerivedTy->getBaseType().resolve(EmptyMap), EmptyMap);
+  }
+  return false;
+}
+
 void DxilDbgValueToDbgDeclare::handleDbgValue(
     llvm::Module& M,
     llvm::DbgValueInst* DbgValue)
@@ -649,16 +687,27 @@ void DxilDbgValueToDbgDeclare::handleDbgValue(
     VALUE_TO_DECLARE_LOG("...Null value!");
     return;
   }
-
-  if (auto *PtrTy = llvm::dyn_cast<llvm::PointerType>(V->getType())) {
-    VALUE_TO_DECLARE_LOG("... variable had null pointer type");
-    return;
-  }
   
   const llvm::DITypeIdentifierMap EmptyMap;
   llvm::DIType *Ty = Variable->getType().resolve(EmptyMap);
   if (Ty == nullptr) {
     return;
+  }
+
+  if (llvm::isa<llvm::PointerType>(V->getType())) {
+    // Safeguard: If the type is not a pointer type, then this is
+    // dbg.value directly pointing to a memory location instead of
+    // a value.
+    if (!IsDITypePointer(Ty, EmptyMap)) {
+      // We only know how to handle AllocaInsts for now
+      if (!isa<AllocaInst>(V)) {
+        VALUE_TO_DECLARE_LOG("... variable had pointer type, but is not an alloca.");
+        return;
+      }
+
+      IRBuilder<> B(DbgValue->getNextNode());
+      V = B.CreateLoad(V);
+    }
   }
 
   // Members' "base type" is actually the containing aggregate's type.
@@ -703,48 +752,43 @@ void DxilDbgValueToDbgDeclare::handleDbgValue(
   }
 
   const OffsetInBits InitialOffset = PackedOffsetFromVar;
-  llvm::IRBuilder<> B(DbgValue->getCalledFunction()->getContext());
-  auto* instruction = llvm::dyn_cast<llvm::Instruction>(V);
-  if (instruction != nullptr) {
-    instruction = instruction->getNextNode();
-    if (instruction != nullptr && !llvm::isa<TerminatorInst>(instruction)) {
-      // Drivers may crash if phi nodes aren't always at the top of a block,
-      // so we must skip over them before inserting instructions.
-      do {
-        instruction = instruction->getNextNode();
-      } while (instruction != nullptr && 
-          llvm::isa<llvm::PHINode>(instruction) &&
-          !llvm::isa<TerminatorInst>(instruction));
+  auto* insertPt = llvm::dyn_cast<llvm::Instruction>(V);
+  if (insertPt != nullptr && !llvm::isa<TerminatorInst>(insertPt)) {
+    insertPt = insertPt->getNextNode();
+    // Drivers may crash if phi nodes aren't always at the top of a block,
+    // so we must skip over them before inserting instructions.
+    while (llvm::isa<llvm::PHINode>(insertPt)) {
+      insertPt = insertPt->getNextNode();
+    }
+
+    if (insertPt != nullptr) {
+      llvm::IRBuilder<> B(insertPt);
+      B.SetCurrentDebugLocation(llvm::DebugLoc());
+
+      auto *Zero = B.getInt32(0);
       
-      if(instruction != nullptr && !llvm::isa<TerminatorInst>(instruction)) {
-        B.SetInsertPoint(instruction);
-        
-        B.SetCurrentDebugLocation(llvm::DebugLoc());
-        auto *Zero = B.getInt32(0);
-        
-        // Now traverse a list of pairs {Scalar Value, InitialOffset + Offset}.
-        // InitialOffset is the offset from DbgValue's expression (i.e., the
-        // offset from the Variable's start), and Offset is the Scalar Value's
-        // packed offset from DbgValue's value.
-        for (const ValueAndOffset &VO : SplitValue(V, InitialOffset, B)) {
-        
-          OffsetInBits AlignedOffset;
-          if (!Offsets.GetAlignedOffsetFromPackedOffset(VO.m_PackedOffset,
-                                                        &AlignedOffset)) {
-            continue;
-          }
-        
-          auto *AllocaInst = Register->GetRegisterForAlignedOffset(AlignedOffset);
-          if (AllocaInst == nullptr) {
-            assert(!"Failed to find alloca for var[offset]");
-            continue;
-          }
-        
-          if (AllocaInst->getAllocatedType()->getArrayElementType() ==
-              VO.m_V->getType()) {
-            auto *GEP = B.CreateGEP(AllocaInst, {Zero, Zero});
-            B.CreateStore(VO.m_V, GEP);
-          }
+      // Now traverse a list of pairs {Scalar Value, InitialOffset + Offset}.
+      // InitialOffset is the offset from DbgValue's expression (i.e., the
+      // offset from the Variable's start), and Offset is the Scalar Value's
+      // packed offset from DbgValue's value.
+      for (const ValueAndOffset &VO : SplitValue(V, InitialOffset, B)) {
+
+        OffsetInBits AlignedOffset;
+        if (!Offsets.GetAlignedOffsetFromPackedOffset(VO.m_PackedOffset,
+                                                      &AlignedOffset)) {
+          continue;
+        }
+
+        auto *AllocaInst = Register->GetRegisterForAlignedOffset(AlignedOffset);
+        if (AllocaInst == nullptr) {
+          assert(!"Failed to find alloca for var[offset]");
+          continue;
+        }
+
+        if (AllocaInst->getAllocatedType()->getArrayElementType() ==
+            VO.m_V->getType()) {
+          auto *GEP = B.CreateGEP(AllocaInst, {Zero, Zero});
+          B.CreateStore(VO.m_V, GEP);
         }
       }
     }
@@ -814,12 +858,13 @@ VariableRegisters::VariableRegisters(
     llvm::Module *M)
   : m_dbgLoc(DbgValue->getDebugLoc())
   , m_Variable(Variable)
-  , m_B(DbgValue)
+  , m_B(DbgValue->getParent()->getParent()->getEntryBlock().begin())
   , m_DbgDeclareFn(llvm::Intrinsic::getDeclaration(
       M, llvm::Intrinsic::dbg_declare))
 {
   PopulateAllocaMap(Ty);
-  assert(m_Offsets.GetCurrentPackedOffset() ==
+  m_Offsets.AlignTo(Ty); // For padding.
+  assert(m_Offsets.GetCurrentAlignedOffset() ==
          DITypePeelTypeAlias(Ty)->getSizeInBits());
 }
 
@@ -870,9 +915,14 @@ void VariableRegisters::PopulateAllocaMap(
     case llvm::dwarf::DW_TAG_class_type:
       PopulateAllocaMap_StructType(CompositeTy);
       return;
-    case llvm::dwarf::DW_TAG_enumeration_type:
-      // enum base type is int:
-      PopulateAllocaMap(CompositeTy->getBaseType().resolve(EmptyMap));
+    case llvm::dwarf::DW_TAG_enumeration_type: {
+      auto * baseType = CompositeTy->getBaseType().resolve(EmptyMap);
+      if (baseType != nullptr) {
+        PopulateAllocaMap(baseType);
+      } else {
+        m_Offsets.AlignToAndAddUnhandledType(CompositeTy);
+      }
+    }
       return;
     }
   }

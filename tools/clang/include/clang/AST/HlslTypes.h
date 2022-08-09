@@ -338,6 +338,13 @@ clang::CXXRecordDecl* DeclareTemplateTypeWithHandle(
             uint8_t templateArgCount,
   _In_opt_  clang::TypeSourceInfo* defaultTypeArgValue);
 
+clang::CXXRecordDecl* DeclareTemplateTypeWithHandleInDeclContext(
+            clang::ASTContext& context,
+            clang::DeclContext *declContext,
+            llvm::StringRef name,
+            uint8_t templateArgCount,
+  _In_opt_  clang::TypeSourceInfo* defaultTypeArgValue);
+
 clang::CXXRecordDecl* DeclareUIntTemplatedTypeWithHandle(
   clang::ASTContext& context, llvm::StringRef typeName, llvm::StringRef templateParamName);
 clang::CXXRecordDecl *DeclareUIntTemplatedTypeWithHandleInDeclContext(
@@ -404,6 +411,7 @@ bool IsHLSLAggregateType(clang::QualType type);
 clang::QualType GetHLSLResourceResultType(clang::QualType type);
 unsigned GetHLSLResourceTemplateUInt(clang::QualType type);
 bool IsIncompleteHLSLResourceArrayType(clang::ASTContext& context, clang::QualType type);
+clang::QualType GetHLSLResourceTemplateParamType(clang::QualType type);
 clang::QualType GetHLSLInputPatchElementType(clang::QualType type);
 unsigned GetHLSLInputPatchCount(clang::QualType type);
 clang::QualType GetHLSLOutputPatchElementType(clang::QualType type);
@@ -438,6 +446,7 @@ bool IsUserDefinedRecordType(clang::QualType type);
 bool DoesTypeDefineOverloadedOperator(clang::QualType typeWithOperator,
                                       clang::OverloadedOperatorKind opc,
                                       clang::QualType paramType);
+bool IsPatchConstantFunctionDecl(const clang::FunctionDecl *FD);
 
 /// <summary>Adds a function declaration to the specified class record.</summary>
 /// <param name="context">ASTContext that owns declarations.</param>

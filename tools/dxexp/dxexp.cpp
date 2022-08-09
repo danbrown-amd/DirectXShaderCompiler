@@ -117,6 +117,7 @@ typedef enum D3D12_RAYTRACING_TIER
 {
     D3D12_RAYTRACING_TIER_NOT_SUPPORTED = 0,
     D3D12_RAYTRACING_TIER_1_0 = 10
+    D3D12_RAYTRACING_TIER_1_1	= 11
 }   D3D12_RAYTRACING_TIER;
 
 typedef struct D3D12_FEATURE_DATA_D3D12_OPTIONS5
@@ -140,9 +141,13 @@ typedef struct D3D12_FEATURE_DATA_D3D12_OPTIONS5
 #define D3D_SHADER_MODEL_6_5 ((D3D_SHADER_MODEL)0x65)
 #endif
 
-#ifndef D3D_SHADER_MODEL_6_6
+#pragma warning( disable : 4063 )
+#define D3D12_RAYTRACING_TIER_1_1 ((D3D12_RAYTRACING_TIER)11)
 #define D3D_SHADER_MODEL_6_6 ((D3D_SHADER_MODEL)0x66)
-#endif
+#define D3D_SHADER_MODEL_6_7 ((D3D_SHADER_MODEL)0x67)
+#define D3D_SHADER_MODEL_6_8 ((D3D_SHADER_MODEL)0x68)
+
+#define DXEXP_HIGHEST_SHADER_MODEL D3D_SHADER_MODEL_6_8
 
 static char *BoolToStrJson(bool value) {
   return value ? "true" : "false";
@@ -168,6 +173,8 @@ static char *ShaderModelToStr(D3D_SHADER_MODEL SM) {
   case D3D_SHADER_MODEL_6_4: return "6.4";
   case D3D_SHADER_MODEL_6_5: return "6.5";
   case D3D_SHADER_MODEL_6_6: return "6.6";
+  case D3D_SHADER_MODEL_6_7: return "6.7";
+  case D3D_SHADER_MODEL_6_8: return "6.8";
   default: return "ERROR";
   }
 }
@@ -186,13 +193,14 @@ static char *RaytracingTierToStr(D3D12_RAYTRACING_TIER Tier) {
   switch (Tier) {
   case D3D12_RAYTRACING_TIER_NOT_SUPPORTED: return "NO";
   case D3D12_RAYTRACING_TIER_1_0: return "1.0";
+  case D3D12_RAYTRACING_TIER_1_1: return "1.1";
   default: return "ERROR";
   }
 }
 
 static HRESULT GetHighestShaderModel(ID3D12Device *pDevice, D3D12_FEATURE_DATA_SHADER_MODEL &DeviceSM) {
   HRESULT hr = E_INVALIDARG;
-  D3D_SHADER_MODEL SM = D3D_SHADER_MODEL_6_6;
+  D3D_SHADER_MODEL SM = DXEXP_HIGHEST_SHADER_MODEL;
   while (hr == E_INVALIDARG && SM >= D3D_SHADER_MODEL_6_0) {
     DeviceSM.HighestShaderModel = SM;
     hr = pDevice->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &DeviceSM, sizeof(DeviceSM));

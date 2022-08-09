@@ -5137,7 +5137,8 @@ static ExprResult CheckConvertedConstantExpression(Sema &S, Expr *From,
                                                    QualType T, APValue &Value,
                                                    Sema::CCEKind CCE,
                                                    bool RequireInt) {
-  assert((S.getLangOpts().CPlusPlus11 || S.getLangOpts().HLSLVersion >= 2017) &&
+  assert((S.getLangOpts().CPlusPlus11 ||
+          S.getLangOpts().HLSLVersion >= hlsl::LangStd::v2017) &&
          "converted constant expression outside C++11");
 
   if (checkPlaceholderForOverload(S, From))
@@ -11019,7 +11020,7 @@ static ExprResult FinishOverloadedCallExpr(Sema &SemaRef, Scope *S, Expr *Fn,
     SemaRef.Diag(Fn->getLocStart(),
          diag::err_ovl_no_viable_function_in_call)
       << ULE->getName() << Fn->getSourceRange();
-    CandidateSet->NoteCandidates(SemaRef, OCD_AllCandidates, Args);
+    CandidateSet->NoteCandidates(SemaRef, OCD_AllCandidates, Args, StringRef(), ULE->getLocStart()); // HLSL Change - add loc
     break;
   }
 

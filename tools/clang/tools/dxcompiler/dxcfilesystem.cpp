@@ -43,7 +43,7 @@ namespace {
 #endif
 
 #ifdef _WIN32
-#ifdef DBG
+#ifndef NDEBUG
 
 // This should be improved with global enabled mask rather than a compile-time mask.
 #define DXTRACE_MASK_ENABLED  0
@@ -61,7 +61,7 @@ namespace {
 
 #define DXTRACE_FMT_APIFS(...)
 
-#endif // DBG
+#endif // NDEBUG
 #else  // _WIN32
 #define DXTRACE_FMT_APIFS(...)
 #endif // _WIN32
@@ -314,12 +314,12 @@ private:
         if (m_bDisplayIncludeProcess) {
           std::string openFileStr;
           raw_string_ostream s(openFileStr);
-          std::string fileName = Unicode::UTF16ToUTF8StringOrThrow(lpFileName);
+          std::string fileName = Unicode::WideToUTF8StringOrThrow(lpFileName);
           s << "Opening file [" << fileName << "], stack top [" << (index-1)
             << "]\n";
           s.flush();
           ULONG cbWritten;
-          IFT(m_pStdErrStream->Write(openFileStr.c_str(), openFileStr.size(),
+          IFT(m_pStdOutStream->Write(openFileStr.c_str(), openFileStr.size(),
                                  &cbWritten));
         }
         return ERROR_SUCCESS;
@@ -356,6 +356,10 @@ public:
     s.write((char*)m_pStdErrStream->GetPtr(), m_pStdErrStream->GetPtrSize());
     s.flush();
   }
+  void WriteStdOutToStream(raw_string_ostream &s) override {
+    s.write((char *)m_pStdOutStream->GetPtr(), m_pStdOutStream->GetPtrSize());
+    s.flush();
+  }
   HRESULT CreateStdStreams(_In_ IMalloc* pMalloc) override {
     DXASSERT(m_pStdOutStream == nullptr, "else already created");
     CreateMemoryStream(pMalloc, &m_pStdOutStream);
@@ -387,8 +391,12 @@ public:
     *ppResult = stream.Detach();
   }
 
-  void GetStdOutpuHandleStream(IStream **ppResultStream) override {
+  void GetStdOutputHandleStream(IStream **ppResultStream) override {
     return GetStreamForHandle(StdOutHandle.Handle, ppResultStream);
+  }
+
+  void GetStdErrorHandleStream(IStream **ppResultStream) override {
+    return GetStreamForHandle(StdErrHandle.Handle, ppResultStream);
   }
 
   void SetupForCompilerInstance(clang::CompilerInstance &compiler) override {
@@ -403,11 +411,11 @@ public:
     for (unsigned i = 0, e = entries.size(); i != e; ++i) {
       const clang::HeaderSearchOptions::Entry &E = entries[i];
       if (dxcutil::IsAbsoluteOrCurDirRelative(E.Path.c_str())) {
-        m_searchEntries.emplace_back(Unicode::UTF8ToUTF16StringOrThrow(E.Path.c_str()));
+        m_searchEntries.emplace_back(Unicode::UTF8ToWideStringOrThrow(E.Path.c_str()));
       }
       else {
         std::wstring ws(L"./");
-        ws += Unicode::UTF8ToUTF16StringOrThrow(E.Path.c_str());
+        ws += Unicode::UTF8ToWideStringOrThrow(E.Path.c_str());
         m_searchEntries.emplace_back(std::move(ws));
       }
     }
@@ -732,7 +740,7 @@ public:
       return -1;
     }
 
-#ifdef _DEBUG
+#ifndef NDEBUG
     if (fd == STDERR_FILENO) {
         char* copyWithNull = new char[count+1];
         strncpy(copyWithNull, (const char*)buffer, count);
@@ -802,13 +810,13 @@ public:
 
   // fake my way toward as linux-y a file_status as I can get
   virtual int Stat(const char *lpFileName, struct stat *Status) throw() override {
-    CA2W fileName_utf16(lpFileName, CP_UTF8);
+    CA2W fileName_wide(lpFileName, CP_UTF8);
 
-    DWORD attr = GetFileAttributesW(fileName_utf16);
+    DWORD attr = GetFileAttributesW(fileName_wide);
     if (attr == INVALID_FILE_ATTRIBUTES)
       return -1;
 
-    HANDLE H = CreateFileW(fileName_utf16, 0, // Attributes only.
+    HANDLE H = CreateFileW(fileName_wide, 0, // Attributes only.
                            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
     if (H == INVALID_HANDLE_VALUE)

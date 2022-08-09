@@ -635,7 +635,9 @@ static unsigned ValidateSignatureRowCol(Instruction *I,
   if (ConstantInt *constRow = dyn_cast<ConstantInt>(rowVal)) {
     unsigned row = constRow->getLimitedValue();
     if (row >= SE.GetRows()) {
-      ValCtx.EmitInstrError(I, ValidationRule::InstrOperandRange);
+      std::string range = std::string("0~") + std::to_string(SE.GetRows());
+      ValCtx.EmitInstrFormatError(I, ValidationRule::InstrOperandRange,
+                            {"Row", range, std::to_string(row)});
     }
   }
 
@@ -649,7 +651,9 @@ static unsigned ValidateSignatureRowCol(Instruction *I,
   unsigned col = cast<ConstantInt>(colVal)->getLimitedValue();
 
   if (col > SE.GetCols()) {
-    ValCtx.EmitInstrError(I, ValidationRule::InstrOperandRange);
+    std::string range = std::string("0~") + std::to_string(SE.GetCols());
+    ValCtx.EmitInstrFormatError(I, ValidationRule::InstrOperandRange,
+                          {"Col", range, std::to_string(col)});
   } else {
     if (SE.IsOutput())
       Status.outputCols[SE.GetID()] |= 1 << col;
@@ -883,10 +887,14 @@ static void ValidateCalcLODResourceDimensionCoord(CallInst *CI, DXIL::ResourceKi
 static void ValidateResourceOffset(CallInst *CI, DXIL::ResourceKind resKind,
                                    ArrayRef<Value *> offsets,
                                    ValidationContext &ValCtx) {
+  const ShaderModel *pSM = ValCtx.DxilMod.GetShaderModel();
+
   unsigned numOffsets = DxilResource::GetNumOffsets(resKind);
   bool hasOffset = !isa<UndefValue>(offsets[0]);
 
   auto validateOffset = [&](Value *offset) {
+    // 6.7 Advanced Textures allow programmable offsets
+    if (pSM->IsSM67Plus()) return;
     if (ConstantInt *cOffset = dyn_cast<ConstantInt>(offset)) {
       int offset = cOffset->getValue().getSExtValue();
       if (offset > 7 || offset < -8) {
@@ -953,6 +961,13 @@ static void ValidateSampleInst(CallInst *CI, Value *srvHandle, Value *samplerHan
   isSampleCompTy |= compTy == DXIL::ComponentType::F16;
   isSampleCompTy |= compTy == DXIL::ComponentType::SNormF16;
   isSampleCompTy |= compTy == DXIL::ComponentType::UNormF16;
+  const ShaderModel *pSM = ValCtx.DxilMod.GetShaderModel();
+  if (pSM->IsSM67Plus()) {
+    isSampleCompTy |= compTy == DXIL::ComponentType::I16;
+    isSampleCompTy |= compTy == DXIL::ComponentType::U16;
+    isSampleCompTy |= compTy == DXIL::ComponentType::I32;
+    isSampleCompTy |= compTy == DXIL::ComponentType::U32;
+  }
   if (!isSampleCompTy) {
     ValCtx.EmitInstrError(CI, ValidationRule::InstrSampleCompType);
   }
@@ -1451,6 +1466,11 @@ static bool ValidateStorageMasks(Instruction *I, DXIL::OpCode opcode, ConstantIn
     ValCtx.EmitInstrError(I, ValidationRule::InstrWriteMaskForTypedUAVStore);
   }
 
+  // write mask must be contiguous (.x .xy .xyz or .xyzw)
+  if (!((uMask == 0xf) || (uMask == 0x7) || (uMask == 0x3) || (uMask == 0x1))) {
+    ValCtx.EmitInstrError(I, ValidationRule::InstrWriteMaskGapForUAV);
+  }
+
   // If a bit is set in the uMask (expected values) that isn't set in stValMask (user provided values)
   // then the user failed to define some of the output values.
   if (uMask & ~stValMask)
@@ -1627,6 +1647,16 @@ static void ValidateResourceDxilOp(CallInst *CI, DXIL::OpCode opcode,
         /*IsSampleC*/ true, ValCtx);
     ValidateDerivativeOp(CI, ValCtx);
   } break;
+  case DXIL::OpCode::SampleCmpLevel: {
+    // sampler must be comparison mode.
+    DxilInst_SampleCmpLevel sample(CI);
+    ValidateSampleInst(
+        CI, sample.get_srv(), sample.get_sampler(),
+        {sample.get_coord0(), sample.get_coord1(), sample.get_coord2(),
+         sample.get_coord3()},
+        {sample.get_offset0(), sample.get_offset1(), sample.get_offset2()},
+        /*IsSampleC*/ true, ValCtx);
+  } break;
   case DXIL::OpCode::SampleCmpLevelZero: {
     // sampler must be comparison mode.
     DxilInst_SampleCmpLevelZero sample(CI);
@@ -1765,6 +1795,8 @@ static void ValidateResourceDxilOp(CallInst *CI, DXIL::OpCode opcode,
     case DXIL::ResourceKind::Texture1DArray:
     case DXIL::ResourceKind::Texture2D:
     case DXIL::ResourceKind::Texture2DArray:
+    case DXIL::ResourceKind::Texture2DMS:
+    case DXIL::ResourceKind::Texture2DMSArray:
     case DXIL::ResourceKind::Texture3D:
       break;
     default:
@@ -1826,7 +1858,8 @@ static void ValidateResourceDxilOp(CallInst *CI, DXIL::OpCode opcode,
         ValCtx.EmitInstrError(CI, ValidationRule::InstrOffsetOnUAVLoad);
       }
       if (!isa<UndefValue>(mipLevel)) {
-        ValCtx.EmitInstrError(CI, ValidationRule::InstrMipOnUAVLoad);
+        if (resKind != DXIL::ResourceKind::Texture2DMS && resKind != DXIL::ResourceKind::Texture2DMSArray )
+          ValCtx.EmitInstrError(CI, ValidationRule::InstrMipOnUAVLoad);
       }
     } else {
       if (resClass != DXIL::ResourceClass::SRV) {
@@ -2034,6 +2067,7 @@ static void ValidateDxilOperationCallInProfile(CallInst *CI,
   case DXIL::OpCode::TextureGatherCmp:
   case DXIL::OpCode::Sample:
   case DXIL::OpCode::SampleCmp:
+  case DXIL::OpCode::SampleCmpLevel:
   case DXIL::OpCode::SampleCmpLevelZero:
   case DXIL::OpCode::SampleBias:
   case DXIL::OpCode::SampleGrad:
@@ -2163,6 +2197,10 @@ static void ValidateDxilOperationCallInProfile(CallInst *CI,
     if ((pOverloadType->isIntegerTy(64)) && !pSM->IsSM66Plus())
       ValCtx.EmitInstrFormatError(CI, ValidationRule::SmOpcodeInInvalidFunction,
                                   {"64-bit atomic operations", "Shader Model 6.6+"});
+    Value *Handle = CI->getOperand(DXIL::OperandIndex::kAtomicBinOpHandleOpIdx);
+    if (!isa<CallInst>(Handle) ||
+        ValCtx.GetResourceFromVal(Handle).getResourceClass() != DXIL::ResourceClass::UAV)
+      ValCtx.EmitInstrError(CI, ValidationRule::InstrAtomicIntrinNonUAV);
   } break;
   case DXIL::OpCode::CreateHandle:
     if (ValCtx.isLibProfile) {
@@ -2832,7 +2870,8 @@ static void ValidateFunctionAttribute(Function *F, ValidationContext &ValCtx) {
         continue;
       }
       StringRef kind = AttrIter->getKindAsString();
-      if (!kind.equals(DXIL::kFP32DenormKindString)) {
+      if (!kind.equals(DXIL::kFP32DenormKindString) &&
+          !kind.equals(DXIL::kWaveOpsIncludeHelperLanesString)) {
         ValCtx.EmitFnAttributeError(F, AttrIter->getKindAsString(),
                                     AttrIter->getValueAsString());
       }
@@ -3150,11 +3189,34 @@ static void ValidateFunctionBody(Function *F, ValidationContext &ValCtx) {
       } break;
       case Instruction::AtomicCmpXchg:
       case Instruction::AtomicRMW: {
-        Type *T = cast<PointerType>(I.getOperand(AtomicRMWInst::getPointerOperandIndex())->getType())->getElementType();
+        Value *Ptr = I.getOperand(AtomicRMWInst::getPointerOperandIndex());
+        PointerType *ptrType = cast<PointerType>(Ptr->getType());
+        Type *elType = ptrType->getElementType();
         const ShaderModel *pSM = ValCtx.DxilMod.GetShaderModel();
-        if ((T->isIntegerTy(64)) && !pSM->IsSM66Plus())
+        if ((elType->isIntegerTy(64)) && !pSM->IsSM66Plus())
           ValCtx.EmitInstrFormatError(&I, ValidationRule::SmOpcodeInInvalidFunction,
                                       {"64-bit atomic operations", "Shader Model 6.6+"});
+
+        if (ptrType->getAddressSpace() != DXIL::kTGSMAddrSpace)
+          ValCtx.EmitInstrError(&I, ValidationRule::InstrAtomicOpNonGroupshared);
+
+        // Drill through GEP and bitcasts
+        while (true) {
+          if (GEPOperator *GEP = dyn_cast<GEPOperator>(Ptr)) {
+            Ptr = GEP->getPointerOperand();
+            continue;
+          }
+          if (BitCastInst *BC = dyn_cast<BitCastInst>(Ptr)) {
+            Ptr = BC->getOperand(0);
+            continue;
+          }
+          break;
+        }
+
+        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
+          if(GV->isConstant())
+            ValCtx.EmitInstrError(&I, ValidationRule::InstrAtomicConst);
+        }
       } break;
 
       }
@@ -3875,8 +3937,6 @@ static void ValidateResources(ValidationContext &ValCtx) {
       }
     }
     switch (uav->GetKind()) {
-    case DXIL::ResourceKind::Texture2DMS:
-    case DXIL::ResourceKind::Texture2DMSArray:
     case DXIL::ResourceKind::TextureCube:
     case DXIL::ResourceKind::TextureCubeArray:
       ValCtx.EmitResourceError(uav.get(),
@@ -5487,16 +5547,17 @@ static void VerifyRDATMatches(_In_ ValidationContext &ValCtx,
   // otherwise, load subobject into DxilModule to generate reference RDAT.
   if (!ValCtx.DxilMod.GetSubobjects()) {
     RDAT::DxilRuntimeData rdat(pRDATData, RDATSize);
-    auto *pSubobjReader = rdat.GetSubobjectTableReader();
-    if (pSubobjReader && pSubobjReader->GetCount() > 0) {
+    auto table = rdat.GetSubobjectTable();
+    if (table && table.Count() > 0) {
       ValCtx.DxilMod.ResetSubobjects(new DxilSubobjects());
-      if (!LoadSubobjectsFromRDAT(*ValCtx.DxilMod.GetSubobjects(), pSubobjReader)) {
+      if (!LoadSubobjectsFromRDAT(*ValCtx.DxilMod.GetSubobjects(), rdat)) {
         ValCtx.EmitFormatError(ValidationRule::ContainerPartMatches, { PartName });
         return;
       }
     }
   }
 
+  // TODO: Implement deep validation, instead of binary comparison before 1.7 release.
   unique_ptr<DxilPartWriter> pWriter(NewRDATWriter(ValCtx.DxilMod));
   VerifyBlobPartMatches(ValCtx, PartName, pWriter.get(), pRDATData, RDATSize);
 
@@ -5628,6 +5689,10 @@ HRESULT ValidateDxilContainerParts(llvm::Module *pModule,
     // Runtime Data (RDAT) for libraries
     case DFCC_RuntimeData:
       if (ValCtx.isLibProfile) {
+        // TODO: validate without exact binary comparison of serialized data
+        //  - support earlier versions
+        //  - verify no newer record versions than known here (size no larger than newest version)
+        //  - verify all data makes sense and matches expectations based on module
         VerifyRDATMatches(ValCtx, GetDxilPartData(pPart), pPart->PartSize);
       } else {
         ValCtx.EmitFormatError(ValidationRule::ContainerPartInvalid, { szFourCC });

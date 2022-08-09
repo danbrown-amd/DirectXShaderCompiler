@@ -912,6 +912,11 @@ def HLSLWaveSize : InheritableAttr {
   let Documentation = [Undocumented];
 }
 
+def HLSLWaveOpsIncludeHelperLanes : InheritableAttr {
+  let Spellings = [CXX11<"", "waveopsincludehelperlanes", 2015>];
+  let Documentation = [Undocumented];
+}
+
 // HLSL Change Ends
 
 // SPIRV Change Starts
@@ -1029,7 +1034,15 @@ def VKCounterBinding : InheritableAttr {
 def VKDecorateExt : InheritableAttr {
   let Spellings = [CXX11<"vk", "ext_decorate">];
   let Subjects = SubjectList<[Function, Var, ParmVar, Field, TypedefName], ErrorDiag>;
-  let Args = [UnsignedArgument<"decorate">, VariadicUnsignedArgument<"literal">];
+  let Args = [UnsignedArgument<"decorate">, VariadicUnsignedArgument<"literals">];
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKDecorateIdExt : InheritableAttr {
+  let Spellings = [CXX11<"vk", "ext_decorate_id">];
+  let Subjects = SubjectList<[Function, Var, ParmVar, Field, TypedefName], ErrorDiag>;
+  let Args = [UnsignedArgument<"decorate">, VariadicExprArgument<"arguments">];
   let LangOpts = [SPIRV];
   let Documentation = [Undocumented];
 }
@@ -1037,7 +1050,7 @@ def VKDecorateExt : InheritableAttr {
 def VKDecorateStringExt : InheritableAttr {
   let Spellings = [CXX11<"vk", "ext_decorate_string">];
   let Subjects = SubjectList<[Function, Var, ParmVar, Field, TypedefName], ErrorDiag>;
-  let Args = [UnsignedArgument<"decorate">, StringArgument<"literals">];
+  let Args = [UnsignedArgument<"decorate">, VariadicStringArgument<"arguments">];
   let LangOpts = [SPIRV];
   let Documentation = [Undocumented];
 }
@@ -1185,6 +1198,62 @@ def VKShaderRecordEXT : InheritableAttr {
   let Subjects = SubjectList<[StructGlobalVar, HLSLBuffer, ConstantBuffer],
                              ErrorDiag, "ExpectedCTBuffer">;
   let Args = [];
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKEarlyAndLateTests : InheritableAttr {
+  let Spellings = [CXX11<"vk", "early_and_late_tests">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKDepthUnchanged : InheritableAttr {
+  let Spellings = [CXX11<"vk", "depth_unchanged">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefUnchangedFront : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_unchanged_front">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefGreaterEqualFront : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_greater_equal_front">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefLessEqualFront : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_less_equal_front">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefUnchangedBack : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_unchanged_back">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefGreaterEqualBack : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_greater_equal_back">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let LangOpts = [SPIRV];
+  let Documentation = [Undocumented];
+}
+
+def VKStencilRefLessEqualBack : InheritableAttr {
+  let Spellings = [CXX11<"vk", "stencil_ref_less_equal_back">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
   let LangOpts = [SPIRV];
   let Documentation = [Undocumented];
 }
