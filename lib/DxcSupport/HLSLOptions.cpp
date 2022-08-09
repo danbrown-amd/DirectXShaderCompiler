@@ -558,7 +558,8 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
                << (unsigned long)opts.HLSLVersion;
 
       if (opts.EnableUnions)
-        errors << "/enable-unions is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-unions is not supported with HLSL Version "
+               << (unsigned long)opts.HLSLVersion;
 
       if (opts.StrictUDTCasting)
         errors << "/enable-udt-casting is not supported with HLSL Version "
