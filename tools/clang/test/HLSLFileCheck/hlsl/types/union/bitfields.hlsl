@@ -1,5 +1,5 @@
 // RUN: %dxc /Zi /enable-bitfields /enable-unions /T vs_6_2 /E main %s | FileCheck %s
-// RUN: %dxc /Zi /HV 2021 /T vs_6_2 /E main %s | FileCheck %s
+// RUN: %dxc /Zi /HV 202x /T vs_6_2 /E main %s | FileCheck %s
 
 RWByteAddressBuffer BufferOut : register(u0);
 
