@@ -529,8 +529,6 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     opts.EnableOperatorOverloading = true;
     // Enable template support
     opts.EnableTemplates = true;
-    // Enable Unions support
-    opts.EnableUnions = true;
     // Determine overload matching based on UDT names, not just types
     opts.StrictUDTCasting = true;
     // Experimental option to enable short-circuiting operators
@@ -541,7 +539,6 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   } else {
     opts.EnableOperatorOverloading = Args.hasFlag(OPT_enable_operator_overloading, OPT_INVALID, false);
     opts.EnableTemplates = Args.hasFlag(OPT_enable_templates, OPT_INVALID, false);
-    opts.EnableUnions = Args.hasFlag(OPT_enable_unions, OPT_INVALID, false);
     opts.StrictUDTCasting = Args.hasFlag(OPT_strict_udt_casting, OPT_INVALID, false);
     opts.EnableShortCircuit = Args.hasFlag(OPT_enable_short_circuit, OPT_INVALID, false);
     opts.EnableBitfields = Args.hasFlag(OPT_enable_bitfields, OPT_INVALID, false);
@@ -557,10 +554,6 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
         errors << "/enable-templates is not supported with HLSL Version "
                << (unsigned long)opts.HLSLVersion;
 
-      if (opts.EnableUnions)
-        errors << "/enable-unions is not supported with HLSL Version "
-               << (unsigned long)opts.HLSLVersion;
-
       if (opts.StrictUDTCasting)
         errors << "/enable-udt-casting is not supported with HLSL Version "
                << (unsigned long)opts.HLSLVersion;
@@ -573,6 +566,24 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
         errors << "/enable-bitfields is not supported with HLSL Version "
                << (unsigned long)opts.HLSLVersion;
 
+      return 1;
+    }
+  }
+
+  // If the HLSL version is 202x, allow the 202x features by default.
+  // If the HLSL version is 2016 or 2018 or 2021, allow them only
+  // when the individual option is enabled.
+  // If the HLSL version is 2015, dissallow these features
+  if (opts.HLSLVersion >= hlsl::LangStd::v202x) {
+    // Enable Unions support
+    opts.EnableUnions = true;
+  } else {
+    opts.EnableUnions = Args.hasFlag(OPT_enable_unions, OPT_INVALID, false);
+
+    if (opts.HLSLVersion <= hlsl::LangStd::v2015) {
+      if (opts.EnableUnions)
+        errors << "/enable-unions is not supported with HLSL Version "
+               << (unsigned long)opts.HLSLVersion;
       return 1;
     }
   }
