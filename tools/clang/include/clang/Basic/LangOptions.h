@@ -164,6 +164,8 @@ public:
   bool EnableOperatorOverloading = false;
   bool StrictUDTCasting = false;
   bool EnablePayloadAccessQualifiers = false;
+  bool EnableShortCircuit = false;
+  bool EnableBitfields = false;
   bool DumpImplicitTopLevelDecls = true;
   /// Whether use row major as default matrix major.
   bool HLSLDefaultRowMajor = false;

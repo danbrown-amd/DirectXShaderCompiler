@@ -524,7 +524,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   // If the HLSL version is 2016 or 2018, allow them only
   // when the individual option is enabled.
   // If the HLSL version is 2015, dissallow these features
-  if (opts.HLSLVersion >= 2021) {
+  if (opts.HLSLVersion >= hlsl::LangStd::v2021) {
     // Enable operator overloading in structs
     opts.EnableOperatorOverloading = true;
     // Enable template support
@@ -543,22 +543,22 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     opts.EnableShortCircuit = Args.hasFlag(OPT_enable_short_circuit, OPT_INVALID, false);
     opts.EnableBitfields = Args.hasFlag(OPT_enable_bitfields, OPT_INVALID, false);
 
-    if (opts.HLSLVersion <= 2015) {
+    if (opts.HLSLVersion <= hlsl::LangStd::v2015) {
 
       if (opts.EnableOperatorOverloading)
-        errors << "/enable-operator-overloading is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-operator-overloading is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
 
       if (opts.EnableTemplates)
-        errors << "/enable-templates is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-templates is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
 
       if (opts.StrictUDTCasting)
-        errors << "/enable-udt-casting is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-udt-casting is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
 
       if (opts.EnableShortCircuit)
-        errors << "/enable-short-circuit is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-short-circuit is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
 
       if (opts.EnableBitfields)
-        errors << "/enable-bitfields is not supported with HLSL Version " << opts.HLSLVersion;
+        errors << "/enable-bitfields is not supported with HLSL Version " << (unsigned long)opts.HLSLVersion;
 
       return 1;
     }

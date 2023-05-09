@@ -2006,7 +2006,7 @@ Parser::DeclGroupPtrTy Parser::ParseDeclaration(unsigned Context,
   case tok::kw_template:
     // HLSL Change Starts
     if (getLangOpts().HLSL &&
-        getLangOpts().HLSLVersion < hlsl::LangStd::v2021) {
+        !getLangOpts().EnableTemplates) {
       Diag(Tok, diag::err_hlsl_reserved_keyword) << Tok.getName();
       SkipMalformedDecl();
       return DeclGroupPtrTy();

@@ -13354,7 +13354,7 @@ bool Sema::DiagnoseHLSLDecl(Declarator &D, DeclContext *DC, Expr *BitWidth,
 
   // Disallow bitfields where not enabled explicitly or by HV
   if (BitWidth) {
-    if (getLangOpts().HLSLVersion < hlsl::LangStd::v2021) {
+    if (!getLangOpts().EnableBitfields) {
       Diag(BitWidth->getExprLoc(), diag::err_hlsl_bitfields);
       result = false;
     } else if (!D.UnusualAnnotations.empty()) {

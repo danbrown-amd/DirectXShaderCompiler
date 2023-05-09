@@ -1744,7 +1744,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
   // If the HLSL version is 2016 or 2018, allow them only
   // when the individual option is enabled.
   // If the HLSL version is 2015, dissallow these features
-  if (Opts.HLSLVersion >= 2021) {
+  if (Opts.HLSLVersion >= hlsl::LangStd::v2021) {
     // Enable operator overloading in structs
     Opts.EnableOperatorOverloading = true;
     // Enable template support
@@ -1763,7 +1763,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
     Opts.StrictUDTCasting = Args.hasArg(OPT_strict_udt_casting);
     Opts.EnableBitfields = Args.hasArg(OPT_enable_bitfields);
 
-    if (Opts.HLSLVersion <= 2015) {
+    if (Opts.HLSLVersion <= hlsl::LangStd::v2015) {
       if (Opts.EnableOperatorOverloading)
         Diags.Report(diag::err_hlsl_invalid_drv_for_feature) << "/enable-operator-overloading" << ver;
       if (Opts.EnableTemplates)
