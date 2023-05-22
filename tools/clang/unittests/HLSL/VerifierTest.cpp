@@ -79,7 +79,6 @@ public:
   TEST_METHOD(RunIncompleteArray)
   TEST_METHOD(RunTemplateChecks)
   TEST_METHOD(RunTemplateLiteralSubstitutionFailure)
-  TEST_METHOD(RunUnionAnon)
   TEST_METHOD(RunUnionDerivedToBase)
   TEST_METHOD(RunUnionSizeOf)
   TEST_METHOD(RunUnions0)
@@ -361,9 +360,6 @@ TEST_F(VerifierTest, RunTemplateChecks) {
 
 TEST_F(VerifierTest, RunTemplateLiteralSubstitutionFailure) {
   CheckVerifiesHLSL(L"template-literal-substitution-failure.hlsl");
-}
-TEST_F(VerifierTest, RunUnionAnon) {
-  CheckVerifiesHLSL(L"union_anon.hlsl");
 }
 
 TEST_F(VerifierTest, RunUnionDerivedToBase) {
