@@ -1119,9 +1119,15 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
       if (m_PreciseOutputSet.count(StringRef(fieldSemName).lower()))
         fieldAnnotation.SetPrecise();
     }
-    // Update offset.
-    CBufferSize = std::max(CBufferSize, CBufferOffset + size);
-    CBufferOffset = CBufferSize;
+    if (RD->isUnion()) {
+        // Find maximum size of union fields
+        CBufferSize = std::max(CBufferSize, size);
+        CBufferOffset = CBufferSize;
+    } else {
+        // Accumulate size of struct
+        CBufferSize = std::max(CBufferSize, CBufferOffset + size);
+        CBufferOffset = CBufferSize;
+    }
 
     ++Field;
   }
