@@ -268,8 +268,7 @@ public:
   DxilTypeSystem(llvm::Module *pModule);
 
   DxilStructAnnotation *AddStructAnnotation(const llvm::StructType *pStructType,
-                                            unsigned numTemplateArgs = 0,
-                                            bool isunion = false);
+                                            unsigned numTemplateArgs = 0);
   void FinishStructAnnotation(DxilStructAnnotation &SA, bool empty_union = false);
   DxilStructAnnotation *GetStructAnnotation(const llvm::StructType *pStructType);
   const DxilStructAnnotation *GetStructAnnotation(const llvm::StructType *pStructType) const;
