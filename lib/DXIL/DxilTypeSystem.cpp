@@ -206,6 +206,12 @@ void DxilStructAnnotation::MarkEmptyStruct() {
 bool DxilStructAnnotation::IsEmptyStruct() {
   return m_FieldAnnotations.empty();
 }
+void DxilStructAnnotation::MarkUnion() {
+  m_IsUnion = true;
+}
+bool DxilStructAnnotation::IsUnion() {
+  return m_IsUnion;
+}
 bool DxilStructAnnotation::IsEmptyBesidesResources() {
   return m_ResourcesContained == HasResources::Only ||
          m_FieldAnnotations.empty();
