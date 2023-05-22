@@ -331,12 +331,12 @@ DxilStructAnnotation *DxilTypeSystem::AddStructAnnotation(const StructType *pStr
   return pA;
 }
 
-void DxilTypeSystem::FinishStructAnnotation(DxilStructAnnotation &SA, bool empty_union) {
+void DxilTypeSystem::FinishStructAnnotation(DxilStructAnnotation &SA) {
   const llvm::StructType *ST = SA.GetStructType();
   DXASSERT(SA.GetNumFields() == ST->getNumElements(), "otherwise, mismatched field count.");
 
   // Update resource containment
-  for (unsigned i = 0; i < SA.GetNumFields() && !SA.ContainsResources() && !empty_union; i++) {
+  for (unsigned i = 0; i < SA.GetNumFields() && !SA.ContainsResources(); i++) {
     if (IsResourceContained(ST->getElementType(i)))
       SA.SetContainsResources();
   }
