@@ -948,14 +948,12 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
   // differently for unions and structs
   if (RD->isUnion() && !RD->field_empty()) {
     FieldDecl *fieldDecl = nullptr;
+    bool largestIsBitfield = false;
+    unsigned largestBitwidth = 0;
 
     for (FieldDecl *Field : RD->fields()) {
       CBufferOffset = 0;
 
-      if (Field->isBitField()) {
-        // TODO: Handle bitfields in unions
-
-      }
       QualType fieldTy = Field->getType();
 
       CBufferOffset = AlignBaseOffset(fieldTy, CBufferOffset, bDefaultRowMajor, CGM, dataLayout);
@@ -992,13 +990,31 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
         CBufferOffset = offset;
       }
 
-      if (CBufferOffset + size > CBufferSize) {
+      if (Field->isBitField() && largestIsBitfield) {
+        CodeGenTypes &Types = CGM.getTypes();
+        ASTContext &Context = Types.getContext();
+        unsigned bitWidth = Field->getBitWidthValue(Context);
+        if (bitWidth > largestBitwidth) {
+          largestBitwidth = bitWidth;
+          CBufferSize = CBufferOffset + size;
+          fieldDecl = Field;
+        }
+      } else if (CBufferOffset + size > CBufferSize) {
         CBufferSize = CBufferOffset + size;
         fieldDecl = Field;
+        if (Field->isBitField()) {
+          CodeGenTypes &Types = CGM.getTypes();
+          ASTContext &Context = Types.getContext();
+          unsigned bitWidth = Field->getBitWidthValue(Context);
+          largestIsBitfield = true;
+          largestBitwidth = bitWidth;
+        } else {
+          largestIsBitfield = false;
+        }
       }
     }
     // TODO(?): Consider refactoring, as this duplicates fieldAnnotation code
-    // from the following branch.
+    // from the else branch.
     std::string fieldSemName = "";
     QualType fieldTy = fieldDecl->getType();
 
@@ -1077,6 +1093,27 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
 
       if (m_PreciseOutputSet.count(StringRef(fieldSemName).lower()))
         fieldAnnotation.SetPrecise();
+    }
+
+    if (fieldDecl->isBitField()) {
+
+      DXASSERT(CGM.getLangOpts().HLSLVersion > hlsl::LangStd::v2015,
+                "We should have already ensured we have no bitfields.");
+      CodeGenTypes &Types = CGM.getTypes();
+      ASTContext &Context = Types.getContext();
+
+      DxilFieldAnnotation bitfieldAnnotation;
+
+      bitfieldAnnotation.SetBitFieldWidth(fieldDecl->getBitWidthValue(Context));
+      const BuiltinType *BTy = fieldDecl->getType()->getAs<BuiltinType>();
+      CompType::Kind kind =
+          BuiltinTyToCompTy(BTy, /*bSNorm*/ false, /*bUNorm*/ false);
+      bitfieldAnnotation.SetCompType(kind);
+      bitfieldAnnotation.SetCBufferOffset(0);
+
+      std::vector<DxilFieldAnnotation> BitFields;
+      BitFields.emplace_back(bitfieldAnnotation);
+      fieldAnnotation.SetBitFields(BitFields);
     }
 
     CBufferSize = std::max(CBufferSize, CBufferOffset + size);
